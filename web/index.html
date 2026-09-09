@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>家用光伏储能</title>
+<link rel="stylesheet" href="s.css">
+</head>
+<body>
+<header>
+  <div>
+    <h1>家用光伏储能</h1>
+    <p class="sub">本地模拟。默认按预测和电价自动排充放</p>
+  </div>
+  <div class="head-r">
+    <span id="clock">--</span>
+    <span id="band"></span>
+  </div>
+</header>
+
+<p id="say" class="say">正在读数…</p>
+
+<section class="nodes">
+  <div class="node" id="n-pv"><b>光伏</b><strong id="pv">--</strong><em>kW</em></div>
+  <div class="node" id="n-load"><b>家里用电</b><strong id="load">--</strong><em>kW</em></div>
+  <div class="node" id="n-batt"><b>电池</b><strong id="batt">--</strong><em>kW</em></div>
+  <div class="node" id="n-grid"><b>电网</b><strong id="grid">--</strong><em>kW</em></div>
+</section>
+
+<section class="soc-wrap">
+  <div class="soc-top">
+    <span>电池电量 <b id="soc">--</b>%</span>
+    <span id="temp"></span>
+  </div>
+  <div class="bar"><i id="socbar"></i></div>
+  <p id="reason" class="reason"></p>
+</section>
+
+<section class="plan">
+  <h2>后面十二小时</h2>
+  <p id="plan-why" class="note"></p>
+  <div id="planbars" class="planbars"></div>
+</section>
+
+<section class="cells">
+  <h2>十六串电芯</h2>
+  <p id="cell-say" class="note">模拟 16 串磷酸铁锂。第 7 节容量故意低一点，用来看均衡。</p>
+  <p class="cell-meta">
+    最高 <b id="vmax">--</b> V
+    最低 <b id="vmin">--</b> V
+    压差 <b id="dv">--</b> mV
+    均衡 <b id="nbal">0</b> 节
+  </p>
+  <div id="cellbars" class="cellbars"></div>
+  <p class="legend"><span class="l-ok"></span>正常 <span class="l-batt"></span>在均衡 <span class="l-hi"></span>偏高或偏低</p>
+  <label class="man">均衡方式
+    <select id="balance">
+      <option value="auto" selected>自动（压差大了改主动）</option>
+      <option value="passive">被动（电阻泄放，充电时）</option>
+      <option value="active">主动（从高的挪到低的）</option>
+      <option value="off">关掉</option>
+    </select>
+  </label>
+</section>
+
+<section class="today">
+  <h2>今天（模拟）</h2>
+  <table>
+    <tr><th>光伏发电</th><td id="t-pv">--</td><th>家里用电</th><td id="t-load">--</td></tr>
+    <tr><th>电池充电</th><td id="t-chg">--</td><th>电池放电</th><td id="t-dis">--</td></tr>
+    <tr><th>从电网买</th><td id="t-buy">--</td><th>卖到电网</th><td id="t-sell">--</td></tr>
+    <tr><th>估算电费</th><td id="t-cost">--</td><th>若没有电池</th><td id="t-cost0">--</td></tr>
+  </table>
+  <p class="note" id="save"></p>
+</section>
+
+<section class="chart-wrap">
+  <h2>功率曲线</h2>
+  <canvas id="chart" width="720" height="180"></canvas>
+  <p class="legend"><span class="l-pv"></span>光伏 <span class="l-load"></span>用电 <span class="l-batt"></span>电池</p>
+</section>
+
+<ul id="alarms" class="alarms" hidden></ul>
+
+<section class="ctrl">
+  <div class="modes" role="group" aria-label="运行方式">
+    <button data-mode="auto">自动</button>
+    <button data-mode="self">自发自用</button>
+    <button data-mode="tou">谷充峰放</button>
+    <button data-mode="manual">手动</button>
+    <button data-mode="stop">停机</button>
+  </div>
+  <label class="man">手动功率
+    <input id="manual" type="range" min="-5" max="5" step="0.1" value="0">
+    <output id="manout">0 kW</output>
+  </label>
+  <div class="row">
+    <button type="button" id="pause">暂停</button>
+    <label>速度
+      <select id="speed">
+        <option value="1" selected>慢</option>
+        <option value="4">中</option>
+        <option value="12">快</option>
+      </select>
+    </label>
+    <button type="button" id="newday">从零点再跑一天</button>
+  </div>
+</section>
+
+<details class="cfg">
+  <summary>家里的装机和电价</summary>
+  <form id="form">
+    <label>光伏 kW <input name="pv_kw" type="number" min="0" max="20" step="0.1"></label>
+    <label>电池 kWh <input name="batt_kwh" type="number" min="1" max="40" step="0.1"></label>
+    <label>逆变器 kW <input name="pcs_kw" type="number" min="1" max="20" step="0.1"></label>
+    <label>当前电量 % <input name="soc" type="number" min="5" max="100" step="0.1"></label>
+    <label>电量下限 % <input name="soc_min" type="number" min="5" max="50" step="1"></label>
+    <label>电量上限 % <input name="soc_max" type="number" min="50" max="100" step="1"></label>
+    <label>峰电 元/kWh <input name="price_peak" type="number" min="0" max="3" step="0.01"></label>
+    <label>平电 元/kWh <input name="price_flat" type="number" min="0" max="3" step="0.01"></label>
+    <label>谷电 元/kWh <input name="price_valley" type="number" min="0" max="3" step="0.01"></label>
+    <label>峰时段 <input name="peak" type="text"></label>
+    <label>谷时段 <input name="valley" type="text"></label>
+    <label class="chk"><input name="export" type="checkbox"> 余电可以上网</label>
+    <p class="note">时段写成 8-11,18-21 这种。电价请改成你当地的，页面上的电费只是按这个算的参考值。</p>
+    <button type="submit">保存</button>
+  </form>
+</details>
+
+<p class="foot">电池放电为正、充电为负；从电网买电为正、卖电为负。数字对不上会在底下提示。</p>
+<p id="llm-st" class="foot"></p>
+<p id="bal" class="foot" hidden></p>
+<script src="s.js"></script>
+</body>
+</html>
