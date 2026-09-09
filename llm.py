@@ -1,8 +1,8 @@
-"""大模型接入。没配密钥时不请求，调度仍用本地规则。
+"""LLM hook. No request is sent until an API key is set. Dispatch still uses local rules.
 
-把 data/llm.json 按 llm.example.json 填好即可。
-兼容 OpenAI 的 /v1/chat/completions（OpenAI、DeepSeek、通义、本地 vLLM 都能用）。
-模型只出建议，充放功率和电芯保护仍由 server 里的硬规则截断。
+Copy llm.example.json to data/llm.json.
+Compatible with OpenAI /v1/chat/completions (OpenAI, DeepSeek, Qwen, local vLLM).
+The model only suggests. Charge power and cell protection stay in server hard rules.
 """
 from __future__ import annotations
 
@@ -24,8 +24,8 @@ DEFAULTS = {
     "timeout": 8,
 }
 
-# 模型必须只回这段 JSON
-REPLY = '{"p_kw": 0, "why": "说明", "balance": "auto"}'
+# Model must return only this JSON
+REPLY = '{"p_kw": 0, "why": "short reason", "balance": "auto"}'
 
 
 def load():
@@ -100,7 +100,7 @@ def payload_ok(state):
 
 
 def suggest(state):
-    """成功返回 {p_kw, why, balance}，未配置或失败返回 None。"""
+    """Return {p_kw, why, balance} or None if not configured / failed."""
     cfg = load()
     if not cfg["enabled"]:
         return None
@@ -111,10 +111,11 @@ def suggest(state):
             {
                 "role": "system",
                 "content": (
-                    "你给一套户用光伏储能出充放建议。放电为正、充电为负，单位 kW。"
-                    "不要超过 pcs_kw。电量要留在 soc_min 和 soc_max 之间。"
-                    "有余电优先入库。峰电尽量放电顶家里用电。谷电只有晚高峰会缺电才买。"
-                    "只返回 JSON，不要其它文字：" + REPLY
+                    "You advise a home solar-plus-storage system. Discharge is positive, charge is negative, in kW. "
+                    "Do not exceed pcs_kw. Keep SOC between soc_min and soc_max. "
+                    "Store surplus first. At peak, cover the house from the battery. "
+                    "At off-peak, buy from the grid only if evening peak will be short. "
+                    "Return JSON only, no other text: " + REPLY
                 ),
             },
             {"role": "user", "content": json.dumps(payload_ok(state), ensure_ascii=False)},
@@ -165,8 +166,8 @@ def parse_reply(text):
         p = float(obj["p_kw"])
     except (TypeError, ValueError):
         return None
-    why = str(obj.get("why") or "模型建议").strip()[:60]
+    why = str(obj.get("why") or "Model suggestion").strip()[:60]
     bal = str(obj.get("balance") or "auto").strip()
     if bal not in ("auto", "passive", "active", "off"):
         bal = "auto"
-    return {"p_kw": p, "why": why or "模型建议", "balance": bal}
+    return {"p_kw": p, "why": why or "Model suggestion", "balance": bal}

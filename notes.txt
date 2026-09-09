@@ -1,0 +1,28 @@
+Home solar storage (local sim)
+
+Python 3.9+. No extra packages. Full description is in README.md.
+
+    cd this folder
+    python3 server.py
+
+Open http://127.0.0.1:8765
+
+Default is Auto: a short solar/load forecast plus time-of-use rates pick charge or discharge.
+Large cell spread switches to active balance. You can still use self-use, peak/off-peak, or manual.
+
+Size and rates are at the bottom of the page. The bill is an estimate at your rates, not a utility invoice.
+
+Cells are a simulated 16s LFP pack. Charge is limited by the highest cell, discharge by the lowest.
+Cell 7 is weaker on purpose. There is no cloud model and no thermal-runaway probability.
+
+LLM (optional):
+    Copy llm.example.json to data/llm.json, set enabled true, fill api_key and model.
+    Or use ESS_LLM_KEY, ESS_LLM_URL, ESS_LLM_MODEL.
+    OpenAI /v1/chat/completions. The model only suggests (p_kw / why / balance).
+    Power still passes SOC limits and cell protection. No request without a key.
+    Status: GET http://127.0.0.1:8765/api/llm
+    Ask once: POST the same URL.
+
+Check the sim:
+
+    python3 server.py check

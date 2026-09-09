@@ -2,7 +2,7 @@
   --bg: #d9ddd4;
   --panel: #f3f4ef;
   --ink: #1e2a24;
-  --muted: #5b675f;
+  --muted: #3a453f;
   --line: #b7c0b3;
   --pv: #8a6a12;
   --load: #2c3230;
@@ -32,7 +32,7 @@ header {
   padding: 16px 18px 14px;
 }
 h1 { font-size: 18px; font-weight: 600; margin: 0; letter-spacing: 0.02em; }
-.sub { margin: 4px 0 0; font-size: 12px; color: #c5d0c4; }
+.sub { margin: 4px 0 0; font-size: 12px; color: #d5ddd4; }
 .head-r { text-align: right; font-variant-numeric: tabular-nums; }
 #clock { display: block; font-size: 16px; }
 #band { font-size: 12px; color: #c5d0c4; }
@@ -163,11 +163,20 @@ button {
   background: #e7ebe2;
   border: 1px solid #8f998a;
   color: var(--ink);
-  padding: 6px 10px;
+  padding: 8px 12px;
+  min-height: 36px;
   cursor: pointer;
 }
 button:hover { background: #dde3d6; }
 button.on { background: var(--head); color: #eef3ea; border-color: var(--head); }
+button:focus-visible,
+select:focus-visible,
+input:focus-visible,
+summary:focus-visible {
+  outline: 2px solid var(--head);
+  outline-offset: 2px;
+}
+.man[hidden] { display: none; }
 .man, .row, form { display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: center; }
 .man { margin-bottom: 8px; font-size: 13px; }
 input[type="range"] { width: 180px; }
@@ -185,4 +194,7 @@ form label { display: flex; flex-direction: column; gap: 4px; font-size: 13px; c
 @media (max-width: 560px) {
   .node strong { font-size: 22px; }
   header { align-items: flex-start; }
+  .cellbars { height: 72px; gap: 2px; }
+  .cellbars i b { font-size: 8px; }
+  table th, table td { font-size: 12px; padding: 4px 3px; }
 }

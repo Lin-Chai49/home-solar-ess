@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""本地跑的家用光伏储能监视。默认是模拟数据，没有接真逆变器。"""
+"""Local home solar + storage monitor. Default data is simulated, no real inverter."""
 from __future__ import annotations
 
 import json
 import math
-import os
 import random
 import sys
 import threading
@@ -38,7 +37,7 @@ DEFAULTS = {
     "balance": "auto",
 }
 
-# 家里一天用电，单位 kW。按三口之家、有晚饭和空调来估，不是实测。
+# Household load in kW. Rough 3-person home with evening cooking and AC, not measured.
 LOAD = (
     (0, 0.32),
     (5, 0.26),
@@ -82,7 +81,7 @@ def median(xs):
     return 0.5 * (s[n // 2 - 1] + s[n // 2])
 
 
-# 16 串户用 48V 磷酸铁锂。开路电压按常见放电曲线估，中间很平。
+# 16s 48V home LFP. OCV from a typical discharge curve; the mid band is flat.
 N_CELL = 16
 LFP_OCV = (
     (0, 2.50),
@@ -106,7 +105,7 @@ DV_BAL = 0.025
 
 
 class Pack:
-    """逐芯电压/温度，整包电流被最差那节卡住。均衡按户用常见做法。"""
+    """Per-cell V/T. Pack current is limited by the worst cell. Home-style balancing."""
 
     def __init__(self, batt_kwh, soc):
         self.cells = []
@@ -163,28 +162,30 @@ class Pack:
         ih = self.cells.index(hi) + 1
         il = self.cells.index(lo) + 1
         if p_kw < -1e-6 and hi["v"] >= V_HI:
-            return 0.0, f"第{ih}节到顶（{hi['v']:.3f} V），停止充电"
+            return 0.0, f"Cell {ih} is full ({hi['v']:.3f} V). Charge stopped."
         if p_kw > 1e-6 and lo["v"] <= V_LO:
-            return 0.0, f"第{il}节到底（{lo['v']:.3f} V），停止放电"
+            return 0.0, f"Cell {il} is empty ({lo['v']:.3f} V). Discharge stopped."
         why = ""
         if p_kw < -1e-6 and hi["v"] >= V_HI_SOFT:
             p_kw *= 0.35
-            why = f"第{ih}节偏高，充电降额"
+            why = f"Cell {ih} is high. Charge derated."
         elif p_kw > 1e-6 and lo["v"] <= V_LO_SOFT:
             p_kw *= 0.35
-            why = f"第{il}节偏低，放电降额"
+            why = f"Cell {il} is low. Discharge derated."
         ht = self.tmax()
         if ht >= 52:
-            return 0.0, "有电芯过热，已停止充放"
+            return 0.0, "A cell is too hot. Charge and discharge stopped."
         if ht >= 45 and p_kw != 0:
             p_kw *= 0.5
-            why = (why + "，" if why else "") + "高温降额"
+            why = (why + " " if why else "") + "Derated for heat."
         return p_kw, why
 
-    def apply(self, p_kw, dt_s, mode):
+    def apply(self, p_kw, dt_s, mode, eta=0.96):
         dt_h = dt_s / 3600.0
+        eta = min(0.99, max(0.5, float(eta)))
         vpack = max(sum(lfp_v(c["soc"]) for c in self.cells), 40.0)
-        i_pack = (p_kw * 1000.0) / vpack
+        p_dc = p_kw / eta if p_kw >= 0 else p_kw * eta
+        i_pack = (p_dc * 1000.0) / vpack
         for c in self.cells:
             c["bal"] = False
             cap = self.cap_ah * c["cap"]
@@ -214,6 +215,7 @@ class Pack:
                 if c["v"] - lo["v"] >= DV_BAL:
                     cap = self.cap_ah * c["cap"]
                     c["soc"] -= 0.08 * dt_h / cap * 100.0
+                    c["soc"] = max(0.0, min(100.0, c["soc"]))
                     c["bal"] = True
         elif mode == "active":
             hi = max(self.cells, key=lambda c: c["v"])
@@ -222,8 +224,8 @@ class Pack:
             i_eq = 0.8
             d_hi = i_eq * dt_h / (self.cap_ah * hi["cap"]) * 100.0
             d_lo = i_eq * dt_h / (self.cap_ah * lo["cap"]) * 100.0 * 0.9
-            hi["soc"] -= d_hi
-            lo["soc"] += d_lo
+            hi["soc"] = max(0.0, min(100.0, hi["soc"] - d_hi))
+            lo["soc"] = max(0.0, min(100.0, lo["soc"] + d_lo))
             hi["bal"] = lo["bal"] = True
 
     def _flags(self):
@@ -233,11 +235,11 @@ class Pack:
         for c in self.cells:
             c["flag"] = ""
             if c["v"] >= V_HI_SOFT:
-                c["flag"] = "高"
+                c["flag"] = "hi"
             elif c["v"] <= V_LO_SOFT:
-                c["flag"] = "低"
+                c["flag"] = "lo"
             elif abs(c["v"] - mv) >= 0.040 or abs(c["t"] - mt) >= 4.0:
-                c["flag"] = "偏"
+                c["flag"] = "off"
 
     def snapshot(self):
         vs = [c["v"] for c in self.cells]
@@ -282,7 +284,7 @@ def pv_curve(hour, peak, cloud):
 
 
 class Brain:
-    """按用电习惯、云量和电价往前看十二小时，决定这一拍充还是放。"""
+    """Look 12 hours ahead from load habit, cloud, and rates, then pick charge or discharge."""
 
     def __init__(self):
         self.load_hat = [lerp_table(LOAD, h + 0.5) for h in range(24)]
@@ -297,16 +299,19 @@ class Brain:
 
     def accept_llm(self, cmd, pcs):
         if not cmd:
-            self.llm_on = False
+            if self.llm_on:
+                self.llm_err = "No reply this tick; still using the last suggestion."
+            else:
+                self.llm_err = self.llm_err or "Not configured or request failed."
             return
         try:
             p = max(-pcs, min(pcs, float(cmd["p_kw"])))
         except (TypeError, ValueError, KeyError):
             self.llm_on = False
-            self.llm_err = "模型返回的功率读不出来"
+            self.llm_err = "Could not read power from the model reply."
             return
         self._llm_p = p
-        self._llm_why = str(cmd.get("why") or "模型建议")[:60]
+        self._llm_why = str(cmd.get("why") or "Model suggestion")[:60]
         self._llm_bal = cmd.get("balance")
         self.llm_on = True
         self.llm_err = ""
@@ -322,8 +327,6 @@ class Brain:
     def decide(self, house, pv, load):
         cfg = house.cfg
         pcs = cfg["pcs_kw"]
-        mn, mx = cfg["soc_min"], cfg["soc_max"]
-        cap = max(cfg["batt_kwh"], 0.1)
         soc = house.soc
         h0 = house.now.hour + house.now.minute / 60.0
         f_pv, f_load, f_band = [], [], []
@@ -333,60 +336,7 @@ class Brain:
             f_load.append(self.load_hat[int(h) % 24])
             f_band.append(price_of(cfg, h)[1])
         f_pv[0], f_load[0] = pv, load
-
-        peak_need = 0.0
-        pv_before_peak = 0.0
-        seen_eve = False
-        for i in range(1, 24):
-            hh = (h0 + i) % 24
-            eve = 17.5 <= hh < 22
-            if f_band[i] == "峰" and eve:
-                seen_eve = True
-                peak_need += max(f_load[i] - f_pv[i], 0.0)
-            elif not seen_eve:
-                pv_before_peak += max(f_pv[i] - f_load[i], 0.0)
-
-        room = (mx - soc) / 100.0 * cap
-        avail = (soc - mn) / 100.0 * cap
-        net = load - pv
-        band = f_band[0]
-        eta = cfg["eta"]
-
-        if net < -0.05:
-            p = max(-pcs, net)
-            why = "有光伏余电，先存进电池"
-        elif band == "峰":
-            if net > 0.05:
-                p = min(pcs, net, max(avail, 0.0))
-                why = "现在峰电，用电池顶家里的用电"
-            else:
-                p = max(-pcs, net)
-                why = "峰时仍有余电，继续入库"
-        elif band == "谷":
-            reserve = min(peak_need / max(eta, 0.5), (mx - mn) / 100.0 * cap)
-            need_grid = reserve - avail - 0.85 * pv_before_peak
-            if need_grid > 0.2 and room > 0.1:
-                p = -min(pcs, need_grid, room)
-                why = "谷电，且晚高峰还缺电，现在低价充"
-            elif pv_before_peak > 1:
-                p = 0.0
-                why = "谷电，白天光伏就能充满，现在不买市电"
-            else:
-                p = 0.0
-                why = "谷电，晚高峰电量够了，电池待命"
-        else:
-            keep = peak_need / max(eta, 0.5)
-            if net > 0.05 and avail > keep + 0.3:
-                p = min(pcs, net, avail - keep)
-                why = "平电，电池先给家里用，峰时再留一截"
-            elif net < -0.05:
-                p = max(-pcs, net)
-                why = "平电，余电入库"
-            else:
-                p = 0.0
-                why = "平电，电量留给峰时，家里走市电"
-
-        p = max(-pcs, min(pcs, p))
+        p, why = self._intent(0, h0, f_pv, f_load, f_band, soc, cfg)
         dv = house.pack.vmax() - house.pack.vmin()
         self.bal = "active" if dv >= 0.05 else "passive"
         if self.llm_on and self._llm_p is not None:
@@ -394,31 +344,76 @@ class Brain:
             why = self._llm_why
             if self._llm_bal in ("passive", "active", "off"):
                 self.bal = self._llm_bal
-        self.plan = self._roll(h0, soc, p, f_pv[:12], f_load[:12], f_band[:12], cfg)
+        self.plan = self._roll(h0, soc, p, f_pv, f_load, f_band, cfg)
         return p, why
+
+    def _intent(self, i, h0, f_pv, f_load, f_band, soc, cfg):
+        pcs = cfg["pcs_kw"]
+        mn, mx = cfg["soc_min"], cfg["soc_max"]
+        cap = max(cfg["batt_kwh"], 0.1)
+        eta = max(cfg["eta"], 0.5)
+        n = len(f_pv)
+        peak_need = 0.0
+        pv_before_peak = 0.0
+        seen_eve = False
+        for j in range(i + 1, n):
+            hh = (h0 + j) % 24
+            eve = 17.5 <= hh < 22
+            if f_band[j] == "Peak" and eve:
+                seen_eve = True
+                peak_need += max(f_load[j] - f_pv[j], 0.0)
+            elif not seen_eve:
+                pv_before_peak += max(f_pv[j] - f_load[j], 0.0)
+
+        room = (mx - soc) / 100.0 * cap
+        avail = (soc - mn) / 100.0 * cap
+        net = f_load[i] - f_pv[i]
+        band = f_band[i]
+
+        if net < -0.05:
+            p = max(-pcs, net, -max(room, 0.0))
+            why = "Solar surplus. Store it in the battery first."
+        elif band == "Peak":
+            if net > 0.05:
+                p = min(pcs, net, max(avail, 0.0))
+                why = "Peak rate. Use the battery to cover the house."
+            else:
+                p = max(-pcs, net, -max(room, 0.0))
+                why = "Still surplus at peak. Keep charging."
+        elif band == "Off-peak":
+            reserve = min(peak_need / eta, (mx - mn) / 100.0 * cap)
+            need_grid = reserve - avail - 0.85 * pv_before_peak
+            if need_grid > 0.2 and room > 0.1:
+                p = -min(pcs, need_grid, room)
+                why = "Off-peak, and evening peak still needs energy. Charge cheap now."
+            elif pv_before_peak > 1:
+                p = 0.0
+                why = "Off-peak. Daytime solar can fill the battery, so skip grid charge."
+            else:
+                p = 0.0
+                why = "Off-peak. Enough energy for evening peak. Battery stands by."
+        else:
+            keep = peak_need / eta
+            if net > 0.05 and avail > keep + 0.3:
+                p = min(pcs, net, avail - keep)
+                why = "Mid rate. Use the battery for the house, keep some for peak."
+            elif net < -0.05:
+                p = max(-pcs, net, -max(room, 0.0))
+                why = "Mid rate. Store the surplus."
+            else:
+                p = 0.0
+                why = "Mid rate. Hold charge for peak. House on the grid."
+        return max(-pcs, min(pcs, p)), why
 
     def _roll(self, h0, soc, p0, f_pv, f_load, f_band, cfg):
         cap = max(cfg["batt_kwh"], 0.1)
-        mn, mx, pcs, eta = cfg["soc_min"], cfg["soc_max"], cfg["pcs_kw"], cfg["eta"]
+        mn, mx, eta = cfg["soc_min"], cfg["soc_max"], max(cfg["eta"], 0.5)
         out = []
         s = soc
         for i in range(12):
-            p = p0 if i == 0 else 0.0
-            if i > 0:
-                net = f_load[i] - f_pv[i]
-                band = f_band[i]
-                room = (mx - s) / 100.0 * cap
-                avail = (s - mn) / 100.0 * cap
-                if net < -0.05:
-                    p = max(-pcs, net, -room)
-                elif band == "峰" and net > 0:
-                    p = min(pcs, net, max(avail, 0.0))
-                elif band == "谷" and room > 0.2:
-                    p = 0.0
-                elif net > 0 and avail > 0.4:
-                    p = min(pcs, net, avail)
-                else:
-                    p = 0.0
+            p, _ = self._intent(i, h0, f_pv, f_load, f_band, s, cfg)
+            if i == 0:
+                p = p0
             if p > 0:
                 s -= p / eta / cap * 100.0
             elif p < 0:
@@ -458,10 +453,10 @@ def in_hours(hour, spec):
 
 def price_of(cfg, hour):
     if in_hours(hour, cfg["peak"]):
-        return cfg["price_peak"], "峰"
+        return cfg["price_peak"], "Peak"
     if in_hours(hour, cfg["valley"]):
-        return cfg["price_valley"], "谷"
-    return cfg["price_flat"], "平"
+        return cfg["price_valley"], "Off-peak"
+    return cfg["price_flat"], "Mid"
 
 
 def load_cfg():
@@ -508,13 +503,6 @@ class House:
         self.alarms = []
         self._reset_today(self.now)
 
-    def _energy(self):
-        return self.soc / 100.0 * self.cfg["batt_kwh"]
-
-    def _set_energy(self, kwh):
-        cap = max(self.cfg["batt_kwh"], 0.1)
-        self.soc = max(0.0, min(100.0, 100.0 * kwh / cap))
-
     def _reset_today(self, t):
         self.day = t.date()
         self.today = {
@@ -542,37 +530,38 @@ class House:
         pcs = cfg["pcs_kw"]
         mn, mx = cfg["soc_min"], cfg["soc_max"]
         if self.mode == "stop":
-            return 0.0, "已停机"
+            self.brain.plan = []
+            return 0.0, "Stopped."
         if self.temp >= 52:
-            return 0.0, "电池过热，已停止充放"
+            return 0.0, "Battery too hot. Charge and discharge stopped."
         if self.mode == "manual":
-            p, why = self.manual, "手动"
+            p, why = self.manual, "Manual"
         elif self.mode == "auto":
             p, why = self.brain.decide(self, pv, load)
         elif self.mode == "tou":
             h = self.now.hour + self.now.minute / 60.0
             if in_hours(h, cfg["valley"]):
                 if self.soc < mx - 0.3:
-                    p, why = -pcs, "谷电充电"
+                    p, why = -pcs, "Off-peak charging"
                 else:
-                    p, why = 0.0, "谷电已充满，待机"
+                    p, why = 0.0, "Off-peak, battery full. Standby."
             elif in_hours(h, cfg["peak"]):
                 p = load - pv
-                why = "峰时电池供电" if p > 0.05 else ("峰时余电充电" if p < -0.05 else "峰时自用")
+                why = "Peak: battery covering the house" if p > 0.05 else ("Peak: storing surplus" if p < -0.05 else "Peak: self-use")
             else:
                 p = load - pv
-                why = "余电充电" if p < -0.05 else ("电池供电" if p > 0.05 else "刚好自用")
+                why = "Storing surplus" if p < -0.05 else ("Battery covering the house" if p > 0.05 else "Load matches solar")
         else:
             p = load - pv
-            why = "余电充电" if p < -0.05 else ("电池供电" if p > 0.05 else "刚好自用")
+            why = "Storing surplus" if p < -0.05 else ("Battery covering the house" if p > 0.05 else "Load matches solar")
 
         p = max(-pcs, min(pcs, p))
         if not cfg["export"]:
             p = min(p, load - pv)
         if p > 0 and self.soc <= mn:
-            return 0.0, "电量到下限，停止放电"
+            return 0.0, "At the minimum charge. Discharge stopped."
         if p < 0 and self.soc >= mx:
-            return 0.0, "电量到上限，停止充电"
+            return 0.0, "At the maximum charge. Charge stopped."
         return p, why
 
     def step(self, dt_s):
@@ -611,7 +600,7 @@ class House:
         bal = self.cfg.get("balance", "auto")
         if bal == "auto":
             bal = self.brain.bal
-        self.pack.apply(p, dt_s, bal)
+        self.pack.apply(p, dt_s, bal, self.cfg.get("eta", 0.96))
         self.soc = self.pack.mean_soc()
         self.temp = self.pack.tmax()
 
@@ -622,7 +611,7 @@ class House:
             pv = max(0.0, pv - cut)
             grid = load - pv - p
             if cut > 0.02:
-                why += "，余电无法上网已弃光"
+                why += " Surplus cannot be exported, so solar is curtailed."
         self.curtail = cut
         self.reason = why
 
@@ -654,20 +643,20 @@ class House:
     def _alarms(self):
         a = []
         if self.temp >= 52:
-            a.append("电池过热，已停止充放")
+            a.append("Battery too hot. Charge and discharge stopped.")
         elif self.temp >= 45:
-            a.append("电池偏热，功率已减半")
+            a.append("Battery is warm. Power is halved.")
         if self.soc <= self.cfg["soc_min"] + 0.3:
-            a.append("电量已到下限")
+            a.append("At the minimum charge.")
         if self.soc >= self.cfg["soc_max"] - 0.3:
-            a.append("电量已到上限")
+            a.append("At the maximum charge.")
         if self.curtail > 0.05:
-            a.append("余电无法上网，正在弃光")
+            a.append("Surplus cannot be exported. Solar is being curtailed.")
         pk = self.pack.snapshot()
         if pk["dv_mv"] >= 40:
-            a.append(f"电芯压差 {pk['dv_mv']} mV，最高第{pk['hi']}节、最低第{pk['lo']}节")
+            a.append(f"Cell spread {pk['dv_mv']} mV. High is cell {pk['hi']}, low is cell {pk['lo']}.")
         if pk["odd"]:
-            a.append("第" + "、".join(str(i) for i in pk["odd"]) + "节和其余差得比较多")
+            a.append("Cell " + ", ".join(str(i) for i in pk["odd"]) + " differs from the rest.")
         self.alarms = a
 
     def snapshot(self):
@@ -734,8 +723,6 @@ def llm_loop():
             cmd = llmapi.suggest(snap)
             with house.lock:
                 house.brain.accept_llm(cmd, house.cfg["pcs_kw"])
-                if cmd is None:
-                    house.brain.llm_err = "请求失败或返回不是 JSON"
         except Exception:
             pass
 
@@ -779,8 +766,16 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, json.dumps(st, ensure_ascii=False), MIME[".json"])
             return
         rel = path.lstrip("/")
+        if not rel or ".." in Path(rel).parts:
+            self._send(404, "not found", "text/plain; charset=utf-8")
+            return
         fp = (WEB / rel).resolve()
-        if fp.is_file() and str(fp).startswith(str(WEB)):
+        try:
+            fp.relative_to(WEB.resolve())
+        except ValueError:
+            self._send(404, "not found", "text/plain; charset=utf-8")
+            return
+        if fp.is_file():
             self._send(200, fp.read_bytes(), MIME.get(fp.suffix, "application/octet-stream"))
             return
         self._send(404, "not found", "text/plain; charset=utf-8")
@@ -788,6 +783,9 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         path = urlparse(self.path).path
         n = int(self.headers.get("Content-Length") or 0)
+        if n > 65536:
+            self._send(413, '{"err":"too large"}', MIME[".json"])
+            return
         raw = self.rfile.read(n) if n else b"{}"
         try:
             req = json.loads(raw.decode("utf-8") or "{}")
@@ -801,7 +799,7 @@ class Handler(BaseHTTPRequestHandler):
             with house.lock:
                 house.brain.accept_llm(cmd, house.cfg["pcs_kw"])
                 if cmd is None:
-                    house.brain.llm_err = "未配置或请求失败"
+                    house.brain.llm_err = "Not configured or request failed."
                 st = dict(llmapi.status())
                 st["using"] = house.brain.llm_on
                 st["err"] = house.brain.llm_err
@@ -875,12 +873,32 @@ def check():
     h2.pack.refresh(0.0)
     p0 = -5.0
     p1, why = h2.pack.constrain(p0)
-    if abs(p1) > 1e-6 or "到顶" not in why:
+    if abs(p1) > 1e-6 or "full" not in why:
         print("cell limit fail", p1, why)
         return 1
-    got = llmapi.parse_reply('{"p_kw": -1.5, "why": "谷充", "balance": "passive"}')
+    got = llmapi.parse_reply('{"p_kw": -1.5, "why": "off-peak charge", "balance": "passive"}')
     if not got or abs(got["p_kw"] + 1.5) > 1e-6:
         print("llm parse fail", got)
+        return 1
+    h3 = House()
+    h3.mode = "auto"
+    h3.cfg["pv_kw"] = 0
+    h3.cfg["pcs_kw"] = 1.0
+    h3.now = h3.now.replace(hour=23, minute=0, second=0, microsecond=0)
+    h3.pack.set_soc(30)
+    h3.soc = h3.pack.mean_soc()
+    h3.cloud = 0
+    h3.brain.cloud_hat = 0
+    h3._noise = 0.5
+    pv = h3.pv_avail(23)
+    load = h3.load_kw(23)
+    h3.brain.observe(23, load, pv, h3.cfg)
+    p, _why = h3._decide(pv, load)
+    if p > -0.2:
+        print("auto valley charge fail", p, _why)
+        return 1
+    if not h3.brain.plan or h3.brain.plan[1]["p"] > -0.05:
+        print("plan valley fail", h3.brain.plan[:3] if h3.brain.plan else None)
         return 1
     print("ok", round(h.today["pv"], 2), round(h.soc, 1), why)
     return 0
@@ -892,7 +910,7 @@ if __name__ == "__main__":
     threading.Thread(target=worker, daemon=True).start()
     threading.Thread(target=llm_loop, daemon=True).start()
     httpd = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
-    print(f"打开 http://127.0.0.1:{PORT}")
+    print(f"Open http://127.0.0.1:{PORT}")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

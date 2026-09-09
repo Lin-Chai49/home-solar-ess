@@ -1,5 +1,5 @@
 const $ = (id) => document.getElementById(id);
-const modes = { auto: "自动", self: "自发自用", tou: "谷充峰放", manual: "手动", stop: "停机" };
+const modes = { auto: "Auto", self: "Self-use", tou: "Peak / off-peak", manual: "Manual", stop: "Stop" };
 let last = null;
 
 function n(v, d) {
@@ -9,32 +9,55 @@ function n(v, d) {
 
 function say(s) {
   const pv = s.pv, load = s.load, batt = s.batt, grid = s.grid;
-  if (s.mode === "auto" && s.reason) return s.reason + "。";
-  if (s.mode === "stop") return "已经停机。";
-  if (batt < -0.08 && grid > 0.08) return `正在从电网给电池充电 ${n(-batt,1)} kW，家里用电也走市电。`;
-  if (batt < -0.08) return `光伏 ${n(pv,1)} kW，家里用 ${n(load,1)} kW，余电在给电池充 ${n(-batt,1)} kW。`;
+  if (s.mode === "stop") return "Stopped.";
+  if (s.mode === "auto" && s.reason) return s.reason;
+  if (batt < -0.08 && grid > 0.08) return `Charging the battery from the grid at ${n(-batt,1)} kW. The house is also on the grid.`;
+  if (batt < -0.08) return `Solar ${n(pv,1)} kW, home ${n(load,1)} kW. Surplus is charging the battery at ${n(-batt,1)} kW.`;
   if (batt > 0.08) {
-    if (pv > 0.08) return `光伏 ${n(pv,1)} kW，不够的部分电池在补 ${n(batt,1)} kW。`;
-    return `晚上主要靠电池，正在放电 ${n(batt,1)} kW。`;
+    if (pv > 0.08) return `Solar ${n(pv,1)} kW. The battery is covering the rest at ${n(batt,1)} kW.`;
+    return `Mostly on battery, discharging at ${n(batt,1)} kW.`;
   }
-  if (grid > 0.08) return `电池没出电，正在从电网买 ${n(grid,1)} kW。`;
-  if (grid < -0.08) return `余电卖到电网 ${n(-grid,1)} kW。`;
-  return "发电和用电差不多，电网几乎不走电。";
+  if (grid > 0.08) return `Battery idle. Importing ${n(grid,1)} kW from the grid.`;
+  if (grid < -0.08) return `Exporting ${n(-grid,1)} kW to the grid.`;
+  return "Solar and load are about even. Little grid flow.";
 }
 
 function fill(s) {
   last = s;
   $("clock").textContent = s.ts;
-  $("band").textContent = s.band + "  " + s.price.toFixed(2) + " 元/kWh";
+  $("band").textContent = s.band + "  " + s.price.toFixed(2) + " /kWh";
   $("say").textContent = say(s);
   $("pv").textContent = n(s.pv, 2);
   $("load").textContent = n(s.load, 2);
-  $("batt").textContent = n(s.batt, 2);
-  $("grid").textContent = n(s.grid, 2);
+  if (s.batt > 0.05) {
+    $("batt-lab").textContent = "Battery discharging";
+    $("batt").textContent = n(s.batt, 2);
+    $("batt-u").textContent = "kW";
+  } else if (s.batt < -0.05) {
+    $("batt-lab").textContent = "Battery charging";
+    $("batt").textContent = n(-s.batt, 2);
+    $("batt-u").textContent = "kW";
+  } else {
+    $("batt-lab").textContent = "Battery";
+    $("batt").textContent = "0.00";
+    $("batt-u").textContent = "idle";
+  }
+  if (s.grid > 0.05) {
+    $("grid-lab").textContent = "Importing";
+    $("grid").textContent = n(s.grid, 2);
+    $("grid-u").textContent = "kW";
+  } else if (s.grid < -0.05) {
+    $("grid-lab").textContent = "Exporting";
+    $("grid").textContent = n(-s.grid, 2);
+    $("grid-u").textContent = "kW";
+  } else {
+    $("grid-lab").textContent = "Grid";
+    $("grid").textContent = "0.00";
+    $("grid-u").textContent = "no flow";
+  }
   $("soc").textContent = n(s.soc, 1);
   $("socbar").style.width = Math.max(0, Math.min(100, s.soc)) + "%";
-  $("temp").textContent = "电池 " + n(s.temp, 1) + " ℃";
-  $("reason").textContent = s.reason || "";
+  $("temp").textContent = "Battery " + n(s.temp, 1) + " °C";
   const t = s.today;
   $("t-pv").textContent = n(t.pv, 2) + " kWh";
   $("t-load").textContent = n(t.load, 2) + " kWh";
@@ -42,18 +65,24 @@ function fill(s) {
   $("t-dis").textContent = n(t.dis, 2) + " kWh";
   $("t-buy").textContent = n(t.buy, 2) + " kWh";
   $("t-sell").textContent = n(t.sell, 2) + " kWh";
-  $("t-cost").textContent = n(t.cost, 2) + " 元";
-  $("t-cost0").textContent = n(t.cost0, 2) + " 元";
+  $("t-cost").textContent = n(t.cost, 2);
+  $("t-cost0").textContent = n(t.cost0, 2);
   const d = t.cost0 - t.cost;
   $("save").textContent = d >= 0
-    ? "按你填的电价估，今天电池大约少花 " + n(d, 2) + " 元。卖电没算进收益。"
-    : "按你填的电价估，今天比不用电池多花 " + n(-d, 2) + " 元。夜里充进电池的电，要等到峰时用出来才划算。";
+    ? "At your rates, the battery is about " + n(d, 2) + " less today. Export credit is not included."
+    : "At your rates, this is about " + n(-d, 2) + " more than without a battery. Off-peak charging pays off when you discharge at peak.";
   document.querySelectorAll("[data-mode]").forEach((b) => {
-    b.classList.toggle("on", b.dataset.mode === s.mode);
+    const on = b.dataset.mode === s.mode;
+    b.classList.toggle("on", on);
+    b.setAttribute("aria-pressed", on ? "true" : "false");
   });
-  $("pause").textContent = s.paused ? "继续" : "暂停";
+  $("pause").textContent = s.paused ? "Resume" : "Pause";
   $("pause").classList.toggle("on", s.paused);
+  $("manwrap").hidden = s.mode !== "manual";
   $("manual").disabled = s.mode !== "manual";
+  const pcs = (s.cfg && s.cfg.pcs_kw) || 5;
+  $("manual").min = String(-pcs);
+  $("manual").max = String(pcs);
   $("manout").textContent = n(s.manual, 1) + " kW";
   const box = $("alarms");
   box.innerHTML = "";
@@ -68,33 +97,46 @@ function fill(s) {
   const bal = $("bal");
   if (Math.abs(s.bal) > 0.1) {
     bal.hidden = false;
-    bal.textContent = "这一拍功率对不上，差 " + n(s.bal, 3) + " kW。";
+    bal.textContent = "Power does not add up this tick, off by " + n(s.bal, 3) + " kW.";
   } else bal.hidden = true;
   draw(s.hist);
   cells(s.cells, s.cfg && s.cfg.balance, s.batt, s.bal_now);
   drawPlan(s.plan, s.reason);
   const llm = s.llm || {};
-  if (llm.enabled && llm.using) $("llm-st").textContent = "大模型：" + (llm.model || "") + " 正在出建议，功率仍受电芯和电量上下限限制。";
-  else if (llm.enabled) $("llm-st").textContent = "大模型已配置，但这一拍还在用本地规则。" + (llm.err ? " " + llm.err : "");
-  else $("llm-st").textContent = "大模型未接入。复制 llm.example.json 为 data/llm.json，填入密钥即可。";
+  const llmEl = $("llm-st");
+  if (llm.enabled && llm.using) {
+    llmEl.hidden = false;
+    llmEl.textContent = "LLM connected (" + (llm.model || "") + "). Suggestions still respect charge limits and cells.";
+  } else if (llm.enabled) {
+    llmEl.hidden = false;
+    llmEl.textContent = "LLM is configured; this tick still uses local rules. " + (llm.err ? llm.err : "");
+  } else {
+    llmEl.hidden = true;
+    llmEl.textContent = "";
+  }
 }
 
 function drawPlan(plan, why) {
-  $("plan-why").textContent = why || "按后面十二小时的光伏、用电和电价来排。";
+  $("plan-why").textContent = why || "Planned from the next 12 hours of solar, load, and rates.";
   const box = $("planbars");
-  box.innerHTML = "";
-  if (!plan || !plan.length) return;
+  if (!plan || !plan.length) { box.innerHTML = ""; return; }
   let mx = 0.4;
   plan.forEach((p) => { mx = Math.max(mx, Math.abs(p.p)); });
-  plan.forEach((p) => {
-    const el = document.createElement("i");
+  if (box.children.length !== plan.length) {
+    box.innerHTML = "";
+    plan.forEach(() => {
+      const el = document.createElement("i");
+      el.appendChild(document.createElement("b"));
+      box.appendChild(el);
+    });
+  }
+  plan.forEach((p, i) => {
+    const el = box.children[i];
     el.style.height = Math.max(6, Math.abs(p.p) / mx * 100) + "%";
     el.className = p.p < -0.05 ? "chg" : (p.p > 0.05 ? "dis" : "");
-    el.title = p.t + " " + p.band + " 电池 " + p.p + " kW  电量 " + p.soc + "%";
-    const lab = document.createElement("b");
-    lab.textContent = p.t.slice(0, 2);
-    el.appendChild(lab);
-    box.appendChild(el);
+    const act = p.p < 0 ? "charge " + n(-p.p, 1) : p.p > 0 ? "discharge " + n(p.p, 1) : "idle";
+    el.title = p.t + " " + p.band + "  " + act + " kW  SOC " + p.soc + "%";
+    el.firstChild.textContent = p.t.slice(0, 2);
   });
 }
 
@@ -105,30 +147,36 @@ function cells(c, bal, batt, balNow) {
   $("dv").textContent = String(c.dv_mv);
   $("nbal").textContent = String(c.nbal);
   if (c.nbal && batt < -0.3 && c.dv_mv >= 40) {
-    $("cell-say").textContent = `压差 ${c.dv_mv} mV。充电电流比均衡电流大得多，压差会先拉开，要到快满或停下时才慢慢收回来。`;
+    $("cell-say").textContent = `Spread ${c.dv_mv} mV. Charge current is much larger than balance current, so the spread widens first and closes near full or idle.`;
   } else if (c.nbal) {
-    $("cell-say").textContent = `压差 ${c.dv_mv} mV，正在均衡。充电看最高第${c.hi}节，放电看最低第${c.lo}节。`;
+    $("cell-say").textContent = `Spread ${c.dv_mv} mV, balancing. Charge is limited by cell ${c.hi}, discharge by cell ${c.lo}.`;
   } else if (c.odd && c.odd.length) {
-    $("cell-say").textContent = `第${c.odd.join("、")}节和其余差得比较多。最高第${c.hi}节 ${n(c.vmax,3)} V，最低第${c.lo}节 ${n(c.vmin,3)} V。`;
+    $("cell-say").textContent = `Cell ${c.odd.join(", ")} differs from the rest. High is cell ${c.hi} at ${n(c.vmax,3)} V, low is cell ${c.lo} at ${n(c.vmin,3)} V.`;
   } else {
-    $("cell-say").textContent = `16 串磷酸铁锂。最高第${c.hi}节，最低第${c.lo}节，压差 ${c.dv_mv} mV。第 7 节容量低一点，是故意设的。`;
+    $("cell-say").textContent = `16-cell LFP. High cell ${c.hi}, low cell ${c.lo}, spread ${c.dv_mv} mV. Cell 7 is weaker on purpose.`;
   }
   if (bal === "auto" && balNow) {
-    $("cell-say").textContent += balNow === "active" ? " 当前自动用主动均衡。" : " 当前自动用被动均衡。";
+    if (c.nbal || c.dv_mv >= 25) {
+      $("cell-say").textContent += balNow === "active" ? " Using active balance." : " Using passive balance.";
+    }
   }
   const box = $("cellbars");
-  box.innerHTML = "";
-  (c.items || []).forEach((it) => {
-    const el = document.createElement("i");
-    const h = Math.max(8, Math.min(100, ((it.v - 2.5) / 1.15) * 100));
-    el.style.height = h + "%";
-    el.title = `第${it.i}节  ${it.v} V  ${it.t} ℃  ${it.soc}%`;
-    if (it.flag) el.className = "odd";
-    else if (it.bal) el.className = "bal";
-    const lab = document.createElement("b");
-    lab.textContent = String(it.i);
-    el.appendChild(lab);
-    box.appendChild(el);
+  const items = c.items || [];
+  if (box.children.length !== items.length) {
+    box.innerHTML = "";
+    items.forEach((it) => {
+      const el = document.createElement("i");
+      const lab = document.createElement("b");
+      lab.textContent = String(it.i);
+      el.appendChild(lab);
+      box.appendChild(el);
+    });
+  }
+  items.forEach((it, i) => {
+    const el = box.children[i];
+    el.style.height = Math.max(8, Math.min(100, ((it.v - 2.5) / 1.15) * 100)) + "%";
+    el.title = `Cell ${it.i}  ${it.v} V  ${it.t} °C  ${it.soc}%`;
+    el.className = it.flag ? "odd" : (it.bal ? "bal" : "");
   });
   const sel = $("balance");
   if (bal && !sel.matches(":focus")) sel.value = bal;
@@ -236,7 +284,7 @@ async function tick() {
     }
     fill(s);
   } catch (err) {
-    $("say").textContent = "读不到数据，看一下是不是程序没开。";
+    $("say").textContent = "No data. Check that the program is running.";
   }
 }
 tick();
