@@ -428,14 +428,20 @@ class Brain:
 
         if net < -0.05:
             p = max(-pcs, net, -max(room, 0.0))
-            why = "Solar surplus. Store it in the battery first."
+            if p < -0.05:
+                why = "Solar surplus. Store it in the battery first."
+            else:
+                why = "Battery is full. Not storing more."
         elif band == "Peak":
             if net > 0.05:
                 p = min(pcs, net, max(avail, 0.0))
-                why = "Peak rate. Use the battery to cover the house."
+                if p > 0.05:
+                    why = "Peak rate. Use the battery to cover the house."
+                else:
+                    why = "Peak rate. Battery is at its minimum, so the house stays on the grid."
             else:
                 p = max(-pcs, net, -max(room, 0.0))
-                why = "Still surplus at peak. Keep charging."
+                why = "Peak rate. Load and solar are about even."
         elif band == "Off-peak":
             reserve = min(peak_need / eta, (mx - mn) / 100.0 * cap)
             need_grid = reserve - avail - 0.85 * pv_before_peak
@@ -452,10 +458,10 @@ class Brain:
             keep = peak_need / eta
             if net > 0.05 and avail > keep + 0.3:
                 p = min(pcs, net, avail - keep)
-                why = "Mid rate. Use the battery for the house, keep some for peak."
-            elif net < -0.05:
-                p = max(-pcs, net, -max(room, 0.0))
-                why = "Mid rate. Store the surplus."
+                if p > 0.05:
+                    why = "Mid rate. Use the battery for the house, keep some for peak."
+                else:
+                    why = "Mid rate. Holding the reserve for evening peak."
             else:
                 p = 0.0
                 why = "Mid rate. Hold charge for peak. House on the grid."
@@ -463,13 +469,17 @@ class Brain:
 
     def _roll(self, h0, soc, p0, f_pv, f_load, f_band, cfg):
         cap = max(cfg["batt_kwh"], 0.1)
-        mn, mx, eta = cfg["soc_min"], cfg["soc_max"], max(cfg["eta"], 0.5)
+        mn, mx = cfg["soc_min"], cfg["soc_max"]
+        eta = min(0.99, max(0.5, cfg["eta"]))
         out = []
         s = soc
         for i in range(12):
             p, _ = self._intent(i, h0, f_pv, f_load, f_band, s, cfg)
             if i == 0:
                 p = p0
+            # One bar is one hour. Clip to the energy the window can take,
+            # and do not draw a discharge the export setting would refuse.
+            p = _clip_hour(p, f_pv[i], f_load[i], s, cfg)
             if p > 0:
                 s -= p / eta / cap * 100.0
             elif p < 0:
@@ -485,6 +495,25 @@ class Brain:
                 "soc": round(s, 1),
             })
         return out
+
+
+def _clip_hour(p, pv, load, soc, cfg):
+    """Limit one plan hour to the inverter, the export rule, and the SOC window."""
+    pcs = max(float(cfg.get("pcs_kw", 5)), 0.0)
+    p = max(-pcs, min(pcs, float(p)))
+    if not cfg.get("export", True) and p > 0:
+        p = min(p, max(float(load) - float(pv), 0.0))
+    cap = max(float(cfg.get("batt_kwh", 10)), 0.1)
+    eta = min(0.99, max(0.5, float(cfg.get("eta", 0.96))))
+    mn = float(cfg.get("soc_min", 0))
+    mx = float(cfg.get("soc_max", 100))
+    if p > 0:
+        room = max(0.0, (float(soc) - mn) / 100.0 * cap)
+        p = min(p, room * eta)
+    elif p < 0:
+        room = max(0.0, (mx - float(soc)) / 100.0 * cap)
+        p = max(p, -(room / eta))
+    return p
 
 
 def in_hours(hour, spec):
@@ -643,6 +672,10 @@ class House:
         if self.mode == "stop":
             self.brain.plan = []
             return 0.0, "Stopped."
+        # The 12-hour bars are the Auto lookahead. Clear them before the heat
+        # return, or a hot pack in another mode keeps the last Auto plan.
+        if self.mode != "auto":
+            self.brain.plan = []
         if self.temp >= 52:
             return 0.0, "Battery too hot. Charge and discharge stopped."
         if self.mode == "manual":
@@ -912,8 +945,9 @@ def _apply_ctrl(target, parsed):
         save_cfg(target.cfg)
     if "mode" in parsed:
         target.mode = parsed["mode"]
+    pcs = target.cfg["pcs_kw"]
+    target.manual = max(-pcs, min(pcs, target.manual))
     if "manual" in parsed:
-        pcs = target.cfg["pcs_kw"]
         target.manual = max(-pcs, min(pcs, parsed["manual"]))
     if "speed" in parsed:
         target.speed = parsed["speed"]
@@ -1032,7 +1066,14 @@ class Handler(BaseHTTPRequestHandler):
             return
         with house.lock:
             _apply_ctrl(house, parsed)
-            house._step(1.0)
+            # Paused means the simulated clock and the pack stay put.
+            # The status and the plan still follow the mode just selected.
+            if not house.paused:
+                house._step(1.0)
+            else:
+                hour = house.now.hour + house.now.minute / 60.0
+                _p, why = house._decide(house.pv_avail(hour), house.load_kw(hour))
+                house.reason = why
             snap = house.snapshot()
         self._send(200, json.dumps(snap, ensure_ascii=False), MIME[".json"])
 
@@ -1291,11 +1332,100 @@ def _check_soc_track():
     return 0
 
 
+def _check_plan():
+    h = _fresh("auto")
+    h.now = datetime(2026, 6, 21, 19, 0, 0)
+    h._reset_today(h.now)
+    h.pack.set_soc(15)
+    h.soc = h.pack.mean_soc()
+    h._noise = 0.5
+    p, why = h._decide(0.0, 1.2)
+    if p > 0.05 or "minimum" not in why:
+        print("floor why", p, why, h.soc)
+        return 1
+    if not h.brain.plan or h.brain.plan[0]["p"] > 0.05:
+        print("floor plan", h.brain.plan[:1] if h.brain.plan else None)
+        return 1
+    h.mode = "self"
+    h.temp = 60
+    p, why = h._decide(0.0, 1.2)
+    if h.brain.plan or "hot" not in why.lower():
+        print("hot plan", p, why, h.brain.plan[:1] if h.brain.plan else None)
+        return 1
+    h.temp = 30
+    h.mode = "auto"
+    h.pack.set_soc(95)
+    h.soc = h.pack.mean_soc()
+    h.now = datetime(2026, 6, 21, 12, 0, 0)
+    p, why = h._decide(4.0, 0.4)
+    if p < -0.05 or "Store it" in why or "full" not in why.lower():
+        print("full why", p, why, h.soc)
+        return 1
+    h.pack.set_soc(16)
+    h.soc = h.pack.mean_soc()
+    h.now = datetime(2026, 6, 21, 19, 0, 0)
+    h.brain.llm_on = True
+    h.brain._llm_p = 5.0
+    h.brain._llm_why = "dump the pack"
+    p, why = h._decide(0.0, 1.2)
+    bar = h.brain.plan[0]["p"] if h.brain.plan else None
+    if bar is None or bar > 0.2 or bar < 0:
+        print("llm plan", h.soc, p, why, bar)
+        return 1
+    h.mode = "self"
+    h._step(60)
+    if h.brain.plan:
+        print("stale plan", len(h.brain.plan), h.reason)
+        return 1
+
+    off = dict(DEFAULTS)
+    off["export"] = False
+    got = _clip_hour(3, 0.2, 0.5, 50, off)
+    if got < 0 or got > 0.3 + 1e-9:
+        print("export clip", got)
+        return 1
+    on = dict(DEFAULTS)
+    got = _clip_hour(3, 0.2, 0.5, 50, on)
+    if abs(got - 3) > 1e-9:
+        print("export on", got)
+        return 1
+    if _clip_hour(5, 0.0, 2.0, 15, on) > 0.05:
+        print("soc floor clip", _clip_hour(5, 0.0, 2.0, 15, on))
+        return 1
+    if _clip_hour(-5, 0.0, 2.0, 95, on) < -0.05:
+        print("soc ceil clip", _clip_hour(-5, 0.0, 2.0, 95, on))
+        return 1
+    return 0
+
+
+def _check_manual_limit():
+    backup = CFG_FILE.read_bytes() if CFG_FILE.exists() else None
+    try:
+        h = _fresh("manual")
+        h.manual = 4
+        _apply_ctrl(h, {"cfg": {"pcs_kw": 1}})
+        if abs(h.manual - 1) > 1e-9 or abs(h.cfg["pcs_kw"] - 1) > 1e-9:
+            print("manual pcs", h.manual, h.cfg["pcs_kw"])
+            return 1
+        _apply_ctrl(h, {"manual": -3})
+        if abs(h.manual + 1) > 1e-9:
+            print("manual low", h.manual)
+            return 1
+        return 0
+    finally:
+        if backup is None:
+            if CFG_FILE.exists():
+                CFG_FILE.unlink()
+        else:
+            CFG_FILE.write_bytes(backup)
+
+
 def _check_http():
     import http.client
 
     prev_mode = house.mode
     prev_manual = house.manual
+    prev_paused = house.paused
     httpd = Server(("127.0.0.1", 0), Handler)
     port = httpd.server_address[1]
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
@@ -1350,6 +1480,7 @@ def _check_http():
         if status != 400 or abs(house.manual - 1.5) > 1e-9:
             print("bad manual", status, house.manual)
             return 1
+        moved_from = house.now
         status, payload = call(
             "POST",
             "/api/ctrl",
@@ -1359,10 +1490,30 @@ def _check_http():
         if status != 200 or b'"mode": "stop"' not in payload and b'"mode":"stop"' not in payload:
             print("mode stop", status, payload[:120])
             return 1
+        if house.now == moved_from:
+            print("clock stuck", house.now)
+            return 1
+        house.paused = True
+        house.mode = "auto"
+        house.brain.plan = [{"t": "00:00", "p": 1}]
+        held = house.now
+        status, payload = call(
+            "POST",
+            "/api/ctrl",
+            body=b'{"mode":"self"}',
+            headers={"Content-Type": "application/json"},
+        )
+        if status != 200 or house.now != held or house.brain.plan:
+            print("paused", status, house.now, held, house.brain.plan[:1] if house.brain.plan else None)
+            return 1
+        if b'"mode": "self"' not in payload and b'"mode":"self"' not in payload:
+            print("paused mode", payload[:120])
+            return 1
         return 0
     finally:
         house.mode = prev_mode
         house.manual = prev_manual
+        house.paused = prev_paused
         httpd.shutdown()
         httpd.server_close()
 
@@ -1383,6 +1534,8 @@ def check():
         _check_export,
         _check_curtail,
         _check_soc_track,
+        _check_plan,
+        _check_manual_limit,
         _check_http,
     ):
         code = part()

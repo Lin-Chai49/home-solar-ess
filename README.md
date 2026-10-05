@@ -23,7 +23,7 @@ Open the page and you get, in this order:
 4. Remaining battery % and temperature
 5. How it runs: Auto, Self-use, Peak/off-peak, Manual, Stop
 6. Today’s energy and an estimated bill at the rates you typed
-7. A 12-hour plan (green = charge, dark = discharge)
+7. A 12-hour plan while Auto is selected (green = charge, dark = discharge). Other modes clear it.
 8. A power chart for the simulated day. Battery is drawn above zero when it is discharging and below zero when it is charging.
 9. Sixteen cell bars
 10. System size and rates, folded at the bottom
@@ -56,7 +56,7 @@ Sanity check for the physics and a few dispatch cases:
 python3 server.py check
 ```
 
-That command should print a line starting with `ok` and exit 0. It checks power balance, the SOC window, cell cutoff, off-peak charging, export curtailment, hour ranges, and the local HTTP paths. The same check runs on Python 3.9, 3.12, and 3.14 in GitHub Actions.
+That command should print a line starting with `ok` and exit 0. It checks power balance, the SOC window, cell cutoff, off-peak charging, export curtailment, hour ranges, the 12-hour plan, a paused save, and the local HTTP paths. The same check runs on Python 3.9, 3.12, and 3.14 in GitHub Actions.
 
 ---
 
@@ -102,9 +102,9 @@ If that residual is more than 0.1 kW, the page shows it. The four tiles on the p
 | Mode | What it does |
 |---|---|
 | **Auto** (default) | Looks ~24 hours ahead at solar, load, and rates, then picks this tick’s charge/discharge. Same rules fill the 12-hour plan. |
-| **Self-use** | Drive battery power toward `load − solar` so the grid stays near zero. |
-| **Peak / off-peak** | Charge from the grid in off-peak hours until the max SOC; cover the house from the battery in peak hours. |
-| **Manual** | A slider sets battery kW (range follows inverter kW). |
+| **Self-use** | Drive battery power toward `load − solar` so the grid stays near zero. The 12-hour plan is cleared. |
+| **Peak / off-peak** | Charge from the grid in off-peak hours until the max SOC; cover the house from the battery in peak hours. The 12-hour plan is cleared. |
+| **Manual** | A slider sets battery kW. The slider and the stored setpoint both follow inverter kW. The 12-hour plan is cleared. |
 | **Stop** | Battery kW = 0. The house takes solar and grid only. The 12-hour plan is cleared. |
 
 Auto is not a neural net. It is a small lookahead:
@@ -113,8 +113,11 @@ Auto is not a neural net. It is a small lookahead:
 - At **peak**, the battery covers the house if it has energy.
 - At **off-peak**, it buys from the grid **only if** the coming evening peak (about 17:30–22:00) would still be short after leftover daytime solar. If daytime sun can fill the pack, it does **not** buy cheap grid power at 1 a.m.
 - At **mid** rate, it may use the battery for the house but keeps a reserve for evening peak.
+- At the SOC limits the status says the battery is full or empty. It does not claim a charge or discharge when the power for that step is about zero.
 
-If an LLM is configured, Auto may use the model’s `p_kw` for this tick. The SOC window, inverter limit, and cell limits still apply after that.
+Each plan bar is one hour. It is clipped to the inverter, to the energy the SOC window can still take that hour, and to the export rule. With export off, a bar does not show a discharge into the grid. Self-use, peak/off-peak, manual, and stop leave the bars empty and say the plan is drawn in Auto.
+
+If an LLM is configured, Auto may use the model’s `p_kw` for this tick. The SOC window, inverter limit, and cell limits still apply after that. The plan bar for that hour is clipped the same way.
 
 Demo speed:
 
@@ -126,7 +129,7 @@ Demo speed:
 
 **Restart today** sets the clock to 00:00 of the simulated day and zeros today’s energy counters. It does **not** wipe cell imbalance.
 
-Saving system size or rates does not rewind the battery. The “Charge now” box is sent only after you edit it.
+Saving system size or rates does not rewind the battery. The “Charge now” box is sent only after you edit it. A control change while paused does not move the simulated clock or the pack. It does refresh the status line and, in Auto, the plan. Lowering inverter kW pulls the manual setpoint back inside the new limit.
 
 ---
 

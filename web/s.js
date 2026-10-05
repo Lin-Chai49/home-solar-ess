@@ -84,6 +84,7 @@ function fill(s) {
   const pcs = (s.cfg && s.cfg.pcs_kw) || 5;
   $("manual").min = String(-pcs);
   $("manual").max = String(pcs);
+  if (document.activeElement !== $("manual")) $("manual").value = String(s.manual);
   $("manout").textContent = n(s.manual, 1) + " kW";
   const box = $("alarms");
   const nextAlarms = (s.alarms || []).join("\n");
@@ -104,7 +105,7 @@ function fill(s) {
   } else bal.hidden = true;
   draw(s.hist);
   cells(s.cells, s.cfg && s.cfg.balance, s.batt, s.bal_now);
-  drawPlan(s.plan, s.reason);
+  drawPlan(s.plan, s.reason, s.mode);
   const llm = s.llm || {};
   const llmEl = $("llm-st");
   if (llm.enabled && llm.using) {
@@ -119,10 +120,17 @@ function fill(s) {
   }
 }
 
-function drawPlan(plan, why) {
-  $("plan-why").textContent = why || "Planned from the next 12 hours of solar, load, and rates.";
+function drawPlan(plan, why, mode) {
   const box = $("planbars");
-  if (!plan || !plan.length) { box.innerHTML = ""; return; }
+  const fallback = "Planned from the next 12 hours of solar, load, and rates.";
+  if (!plan || !plan.length) {
+    box.innerHTML = "";
+    $("plan-why").textContent = (mode && mode !== "auto")
+      ? "The 12-hour plan is drawn in Auto."
+      : (why || fallback);
+    return;
+  }
+  $("plan-why").textContent = why || fallback;
   let mx = 0.4;
   plan.forEach((p) => { mx = Math.max(mx, Math.abs(p.p)); });
   if (box.children.length !== plan.length) {
