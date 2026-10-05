@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Home solar storage</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' fill='%2324312b'/%3E%3Ccircle cx='8' cy='8' r='3.2' fill='%23c6a15a'/%3E%3C/svg%3E">
 <link rel="stylesheet" href="s.css">
 </head>
 <body>
@@ -19,7 +20,7 @@
 </header>
 
 <p id="say" class="say">Reading…</p>
-<ul id="alarms" class="alarms" hidden></ul>
+<ul id="alarms" class="alarms" hidden aria-live="polite"></ul>
 
 <section class="nodes">
   <div class="node" id="n-pv"><b>Solar</b><strong id="pv">--</strong><em>kW</em></div>
@@ -50,7 +51,7 @@
     <output id="manout">0 kW</output>
   </label>
   <div class="row">
-    <button type="button" id="pause">Pause</button>
+    <button type="button" id="pause" aria-pressed="false">Pause</button>
     <label>Demo speed
       <select id="speed" aria-label="Demo speed">
         <option value="1" selected>Slow</option>
@@ -85,6 +86,7 @@
   <h2>Today's power</h2>
   <canvas id="chart" width="720" height="180"></canvas>
   <p class="legend"><span class="l-pv"></span>Solar <span class="l-load"></span>Load <span class="l-batt"></span>Battery</p>
+  <p class="note">Battery above zero is discharging. Below zero is charging. The line covers today, not only the last few hours.</p>
 </section>
 
 <section class="cells">
@@ -114,16 +116,17 @@
     <label>Solar kW <input name="pv_kw" type="number" min="0" max="20" step="0.1"></label>
     <label>Battery kWh <input name="batt_kwh" type="number" min="1" max="40" step="0.1"></label>
     <label>Inverter kW <input name="pcs_kw" type="number" min="1" max="20" step="0.1"></label>
-    <label>Charge now % <input name="soc" type="number" min="5" max="100" step="0.1"></label>
+    <label>Efficiency <input name="eta" type="number" min="0.5" max="0.99" step="0.01"></label>
+    <label>Charge now % <input name="soc" type="number" min="5" max="100" step="any"></label>
     <label>Min % <input name="soc_min" type="number" min="5" max="50" step="1"></label>
     <label>Max % <input name="soc_max" type="number" min="50" max="100" step="1"></label>
     <label>Peak /kWh <input name="price_peak" type="number" min="0" max="3" step="0.01"></label>
     <label>Mid /kWh <input name="price_flat" type="number" min="0" max="3" step="0.01"></label>
     <label>Off-peak /kWh <input name="price_valley" type="number" min="0" max="3" step="0.01"></label>
-    <label>Peak hours <input name="peak" type="text"></label>
-    <label>Off-peak hours <input name="valley" type="text"></label>
+    <label>Peak hours <input name="peak" type="text" maxlength="80"></label>
+    <label>Off-peak hours <input name="valley" type="text" maxlength="80"></label>
     <label class="chk"><input name="export" type="checkbox"> Export surplus to the grid</label>
-    <p class="note">Hours like 8-11,18-21 mean from that hour until the next. 8-11 is 8:00 to 11:00. The bill is an estimate at your rates, not a utility invoice.</p>
+    <p class="note">Hours like 8-11,18-21 mean from that hour until the next. 8-11 is 8:00 to 11:00. Efficiency is one way: charge stores power times this number, and discharge takes power divided by it. Charge now is applied only if you edit that box. The bill is an estimate at your rates, not a utility invoice.</p>
     <button type="submit">Save settings</button>
   </form>
 </details>

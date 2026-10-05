@@ -24,7 +24,7 @@ Open the page and you get, in this order:
 5. How it runs: Auto, Self-use, Peak/off-peak, Manual, Stop
 6. Today’s energy and an estimated bill at the rates you typed
 7. A 12-hour plan (green = charge, dark = discharge)
-8. A power chart for the simulated day
+8. A power chart for the simulated day. Battery is drawn above zero when it is discharging and below zero when it is charging.
 9. Sixteen cell bars
 10. System size and rates, folded at the bottom
 
@@ -56,7 +56,7 @@ Sanity check for the physics and a few dispatch cases:
 python3 server.py check
 ```
 
-That command should print a line starting with `ok` and exit 0.
+That command should print a line starting with `ok` and exit 0. It checks power balance, the SOC window, cell cutoff, off-peak charging, export curtailment, hour ranges, and the local HTTP paths. The same check runs on Python 3.9, 3.12, and 3.14 in GitHub Actions.
 
 ---
 
@@ -67,9 +67,9 @@ That command should print a line starting with `ok` and exit 0.
 | Solar | 6 kW | Clear-sky sine between about 05:40 and 19:00, times a moving cloud factor 0.45–1.0 |
 | Battery | 10 kWh | 16 series LFP cells, nominal 3.2 V each (~51 V pack) |
 | Inverter | 5 kW | Charge and discharge are clipped to this |
-| Round-trip path | η = 0.96 | Charge stores `P × η`; discharge draws `P / η` from the pack |
-| SOC window | 15%–95% | Hard stop at the window, even in Auto |
-| Export | on | If you uncheck it, reverse grid power is cut and leftover solar is curtailed |
+| Round-trip path | η = 0.96 | Charge stores `P × η`; discharge draws `P / η` from the pack. Editable as Efficiency. |
+| SOC window | 15%–95% | Hard stop at the window, even in Auto. One step cannot run past it. |
+| Export | on | If you uncheck it, the battery will not discharge into the grid. Leftover solar is curtailed. A discharge command is not turned into a charge. |
 | Peak hours | `8-11,18-21` | 08:00–11:00 and 18:00–21:00, **not including** the end hour (21:00 is Mid) |
 | Off-peak hours | `23-7` | 23:00–07:00, wrapping midnight |
 | Peak / mid / off-peak rates | 0.72 / 0.52 / 0.28 per kWh | Whatever currency you use; the page does not convert FX |
@@ -126,6 +126,8 @@ Demo speed:
 
 **Restart today** sets the clock to 00:00 of the simulated day and zeros today’s energy counters. It does **not** wipe cell imbalance.
 
+Saving system size or rates does not rewind the battery. The “Charge now” box is sent only after you edit it.
+
 ---
 
 ## 16-cell pack
@@ -135,7 +137,7 @@ The pack is **16 cells in series**, lithium iron phosphate, household 48 V class
 - Open-circuit voltage follows a typical LFP curve: steep at the bottom, **almost flat from ~20–80%**, then a knee near full. Voltage-based balancing therefore does little in the mid band and shows up near the top.
 - Pack current is the same through every series cell. A weaker cell’s SOC moves faster.
 - **Cell 7** is given lower capacity (~0.94×) and higher resistance on purpose, so the UI has something to show. Cell 3 starts a little higher.
-- Terminal voltage includes IR drop: during charge a high-resistance cell looks **higher** in volts even if its SOC is behind.
+- Terminal voltage includes IR drop: during charge a high-resistance cell looks **higher** in volts even if its SOC is behind. That drop uses the DC pack current, after the one-way efficiency.
 
 **Limits (per cell)**
 
@@ -172,7 +174,7 @@ Today’s “Est. bill” is:
 sum(grid import in each tick × rate in force at that hour)
 ```
 
-“Without battery” uses `max(load − solar, 0)` at the same rates. Export **credit is not added**. If the battery charged a lot at off-peak and has not yet discharged at peak, the estimate can look **worse** than no battery for that day. The page says so.
+“Without battery” uses `max(load − solar, 0)` at the same rates. Solar there is the resource before curtailment, so turning export off does not make the no-battery bill look worse. Export **credit is not added**. If the battery charged a lot at off-peak and has not yet discharged at peak, the estimate can look **worse** than no battery for that day. The page says so.
 
 Rates are whatever you type. Defaults look like a residential TOU tariff; they are not a live utility feed.
 
@@ -190,7 +192,7 @@ Hour strings: `8-11,18-21` means from hour 8 up to **but not including** hour 11
 | GET | `/api/llm` | Whether an LLM is configured |
 | POST | `/api/llm` | Ask the model once |
 
-POST bodies larger than 64 KB are rejected. Static files cannot leave the `web/` folder. The process listens on `127.0.0.1` only.
+POST bodies larger than 64 KB are rejected, as is a Content-Length that is not a number. Static files cannot leave the `web/` folder. The process listens on `127.0.0.1` only. If that port is already taken, the process says so and exits.
 
 ---
 
@@ -228,8 +230,9 @@ llm.py             Optional OpenAI-compatible client
 llm.example.json   Template for data/llm.json
 web/index.html     Page
 web/s.css          Styles
-web/s.js           Poll /api/state about every 0.7 s
+web/s.js           Poll /api/state about every 0.7 s, slower while the tab is hidden
 notes.txt          Short run notes
+.github/workflows/check.yml   Python 3.9 / 3.12 / 3.14 sanity check
 LICENSE            MIT
 ```
 

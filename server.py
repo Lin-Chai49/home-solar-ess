@@ -133,10 +133,44 @@ class Pack:
         self.refresh(0.0)
 
     def set_soc(self, soc):
-        base = max(5.0, min(98.0, soc))
+        base = max(0.0, min(100.0, float(soc)))
         for i, c in enumerate(self.cells):
-            c["soc"] = max(5.0, min(98.0, base + (-4.0 if i == 6 else 2.2 if i == 2 else 0.0)))
+            off = -4.0 if i == 6 else 2.2 if i == 2 else 0.0
+            c["soc"] = max(0.0, min(100.0, base + off))
         self.refresh(0.0)
+
+    def _vpack(self):
+        return max(sum(lfp_v(c["soc"]) for c in self.cells), 40.0)
+
+    def _current(self, p_kw, eta):
+        """Pack amps. Discharge is positive. Same one-way eta as apply()."""
+        eta = min(0.99, max(0.5, float(eta)))
+        p_dc = p_kw / eta if p_kw >= 0 else p_kw * eta
+        return (p_dc * 1000.0) / self._vpack()
+
+    def ac_kw_for_mean_dsoc(self, dsoc, dt_h, eta):
+        """AC kW that moves mean SOC by dsoc percent over dt_h hours."""
+        if dt_h <= 0 or dsoc == 0:
+            return 0.0
+        eta = min(0.99, max(0.5, float(eta)))
+        inv = 0.0
+        for c in self.cells:
+            inv += 1.0 / (self.cap_ah * c["cap"])
+        inv /= float(N_CELL)
+        if inv <= 0:
+            return 0.0
+        p_dc = -dsoc * self._vpack() / (1e5 * dt_h * inv)
+        if p_dc >= 0:
+            return p_dc * eta
+        return p_dc / eta
+
+    def _near_stop(self):
+        if self.tmax() >= 44.0:
+            return True
+        for c in self.cells:
+            if c["v"] >= V_HI - 0.04 or c["v"] <= V_LO + 0.08:
+                return True
+        return False
 
     def mean_soc(self):
         return sum(c["soc"] for c in self.cells) / N_CELL
@@ -154,9 +188,8 @@ class Pack:
         for c in self.cells:
             c["v"] = lfp_v(c["soc"]) - i_pack * c["r"]
 
-    def constrain(self, p_kw):
-        vpack = max(sum(lfp_v(c["soc"]) for c in self.cells), 40.0)
-        self.refresh((p_kw * 1000.0) / vpack)
+    def constrain(self, p_kw, eta=0.96):
+        self.refresh(self._current(p_kw, eta))
         hi = max(self.cells, key=lambda c: c["v"])
         lo = min(self.cells, key=lambda c: c["v"])
         ih = self.cells.index(hi) + 1
@@ -181,13 +214,42 @@ class Pack:
         return p_kw, why
 
     def apply(self, p_kw, dt_s, mode, eta=0.96):
+        """Integrate a requested AC kW. Returns (average kW, limit reason).
+
+        Short slices so a one-minute step cannot run through a hard cell limit.
+        Once charge or discharge is stopped, the rest of the step only cools.
+        """
+        if dt_s <= 0:
+            self._flags()
+            return 0.0, ""
+        eta = min(0.99, max(0.5, float(eta)))
+        for c in self.cells:
+            c["bal"] = False
+        left = float(dt_s)
+        used = 0.0
+        why = ""
+        req = float(p_kw)
+        while left > 1e-6:
+            p_now, w = self.constrain(req, eta)
+            if w:
+                why = w
+            if abs(p_now) < 1e-9:
+                self._integrate(0.0, left, mode, eta)
+                break
+            slice_s = min(left, 1.0 if self._near_stop() else 5.0)
+            self._integrate(p_now, slice_s, mode, eta)
+            used += p_now * slice_s
+            left -= slice_s
+        self._flags()
+        return used / float(dt_s), why
+
+    def _integrate(self, p_kw, dt_s, mode, eta):
         dt_h = dt_s / 3600.0
         eta = min(0.99, max(0.5, float(eta)))
-        vpack = max(sum(lfp_v(c["soc"]) for c in self.cells), 40.0)
+        vpack = self._vpack()
         p_dc = p_kw / eta if p_kw >= 0 else p_kw * eta
         i_pack = (p_dc * 1000.0) / vpack
         for c in self.cells:
-            c["bal"] = False
             cap = self.cap_ah * c["cap"]
             c["soc"] -= i_pack * dt_h / cap * 100.0
             c["soc"] = max(0.0, min(100.0, c["soc"]))
@@ -197,8 +259,6 @@ class Pack:
         self.refresh(i_pack)
         self._balance(mode, p_kw, i_pack, dt_h)
         self.refresh(i_pack)
-        self._flags()
-        return i_pack
 
     def _balance(self, mode, p_kw, i_pack, dt_h):
         if mode == "off" or dt_h <= 0:
@@ -337,13 +397,9 @@ class Brain:
             f_band.append(price_of(cfg, h)[1])
         f_pv[0], f_load[0] = pv, load
         p, why = self._intent(0, h0, f_pv, f_load, f_band, soc, cfg)
-        dv = house.pack.vmax() - house.pack.vmin()
-        self.bal = "active" if dv >= 0.05 else "passive"
         if self.llm_on and self._llm_p is not None:
             p = max(-pcs, min(pcs, self._llm_p))
             why = self._llm_why
-            if self._llm_bal in ("passive", "active", "off"):
-                self.bal = self._llm_bal
         self.plan = self._roll(h0, soc, p, f_pv, f_load, f_band, cfg)
         return p, why
 
@@ -459,18 +515,73 @@ def price_of(cfg, hour):
     return cfg["price_flat"], "Mid"
 
 
+def as_bool(v):
+    if isinstance(v, str):
+        return v.strip().lower() in ("1", "true", "yes", "on")
+    return bool(v)
+
+
+def finite(v):
+    if isinstance(v, bool) or v is None:
+        raise ValueError("bad number")
+    x = float(v)
+    if x != x or x in (float("inf"), float("-inf")):
+        raise ValueError("bad number")
+    return x
+
+
+def clean_hours(spec):
+    raw = spec if isinstance(spec, str) else ""
+    return "".join(ch for ch in raw[:80] if ch.isdigit() or ch in ",- ")
+
+
+def clamp_cfg(cfg):
+    """Keep saved settings inside the range the physics can run."""
+    out = dict(DEFAULTS)
+    src = cfg if isinstance(cfg, dict) else {}
+    for k in DEFAULTS:
+        if k in src:
+            out[k] = src[k]
+
+    def num(key, lo, hi):
+        try:
+            v = finite(out[key])
+        except (TypeError, ValueError):
+            v = float(DEFAULTS[key])
+        out[key] = max(lo, min(hi, v))
+
+    num("pv_kw", 0.0, 30.0)
+    num("batt_kwh", 1.0, 100.0)
+    num("pcs_kw", 0.2, 30.0)
+    num("eta", 0.5, 0.99)
+    num("price_peak", 0.0, 10.0)
+    num("price_flat", 0.0, 10.0)
+    num("price_valley", 0.0, 10.0)
+    num("soc_min", 0.0, 80.0)
+    num("soc_max", 0.0, 100.0)
+    if out["soc_max"] < out["soc_min"] + 5:
+        out["soc_max"] = min(100.0, out["soc_min"] + 5)
+    out["export"] = as_bool(out.get("export"))
+    out["peak"] = clean_hours(out.get("peak"))
+    out["valley"] = clean_hours(out.get("valley"))
+    bal = str(out.get("balance") or "auto")
+    out["balance"] = bal if bal in ("off", "passive", "active", "auto") else "auto"
+    return out
+
+
 def load_cfg():
     DATA.mkdir(exist_ok=True)
     cfg = dict(DEFAULTS)
     if CFG_FILE.exists():
         try:
             saved = json.loads(CFG_FILE.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+            saved = None
+        if isinstance(saved, dict):
             for k in DEFAULTS:
                 if k in saved:
-                    cfg[k] = type(DEFAULTS[k])(saved[k])
-        except (OSError, json.JSONDecodeError, TypeError, ValueError):
-            pass
-    return cfg
+                    cfg[k] = saved[k]
+    return clamp_cfg(cfg)
 
 
 def save_cfg(cfg):
@@ -556,13 +667,53 @@ class House:
             why = "Storing surplus" if p < -0.05 else ("Battery covering the house" if p > 0.05 else "Load matches solar")
 
         p = max(-pcs, min(pcs, p))
-        if not cfg["export"]:
-            p = min(p, load - pv)
+        # Export off stops a discharge from pushing power out. It does not
+        # turn a discharge command into a charge; leftover solar is curtailed.
+        if not cfg["export"] and p > 0:
+            p = min(p, max(load - pv, 0.0))
         if p > 0 and self.soc <= mn:
             return 0.0, "At the minimum charge. Discharge stopped."
         if p < 0 and self.soc >= mx:
             return 0.0, "At the maximum charge. Charge stopped."
         return p, why
+
+    def _clamp_window(self, p, dt_s, eta):
+        """Limit this step so mean SOC does not cross the window."""
+        dt_h = dt_s / 3600.0
+        if dt_h <= 0 or p == 0:
+            return p
+        mn, mx = self.cfg["soc_min"], self.cfg["soc_max"]
+        if p > 0:
+            room = mn - self.soc
+            if room >= -1e-6:
+                return 0.0
+            cap_p = self.pack.ac_kw_for_mean_dsoc(room, dt_h, eta)
+            if cap_p <= 0:
+                return 0.0
+            return min(p, cap_p)
+        room = mx - self.soc
+        if room <= 1e-6:
+            return 0.0
+        cap_p = self.pack.ac_kw_for_mean_dsoc(room, dt_h, eta)
+        if cap_p >= 0:
+            return 0.0
+        return max(p, cap_p)
+
+    def _balance_mode(self):
+        choice = self.cfg.get("balance", "auto")
+        if choice in ("off", "passive", "active"):
+            self.brain.bal = choice
+            return choice
+        if (
+            self.mode == "auto"
+            and self.brain.llm_on
+            and self.brain._llm_bal in ("passive", "active", "off")
+        ):
+            self.brain.bal = self.brain._llm_bal
+            return self.brain._llm_bal
+        dv = self.pack.vmax() - self.pack.vmin()
+        self.brain.bal = "active" if dv >= 0.05 else "passive"
+        return self.brain.bal
 
     def step(self, dt_s):
         if dt_s <= 0:
@@ -585,25 +736,22 @@ class House:
         load = self.load_kw(hour)
         self.brain.observe(hour, load, pv, self.cfg)
         p, why = self._decide(pv, load)
-        p2, why2 = self.pack.constrain(p)
+        eta = min(0.99, max(0.5, float(self.cfg.get("eta", 0.96))))
+        self.pack.cap_ah = max(self.cfg["batt_kwh"], 0.1) * 1000.0 / N_CELL / 3.2
+        p = self._clamp_window(p, dt_s, eta)
+        p, why2 = self.pack.apply(p, dt_s, self._balance_mode(), eta)
         if why2:
-            p, why = p2, why2
-        else:
-            p = p2
+            why = why2
+        self.soc = self.pack.mean_soc()
+        self.temp = self.pack.tmax()
 
         dt_h = dt_s / 3600.0
         if p > 0:
             self.today["dis"] += p * dt_h
         elif p < 0:
             self.today["chg"] += (-p) * dt_h
-        self.pack.cap_ah = max(self.cfg["batt_kwh"], 0.1) * 1000.0 / N_CELL / 3.2
-        bal = self.cfg.get("balance", "auto")
-        if bal == "auto":
-            bal = self.brain.bal
-        self.pack.apply(p, dt_s, bal, self.cfg.get("eta", 0.96))
-        self.soc = self.pack.mean_soc()
-        self.temp = self.pack.tmax()
 
+        pv_resource = pv
         grid = load - pv - p
         cut = 0.0
         if (not self.cfg["export"]) and grid < -1e-6:
@@ -618,7 +766,7 @@ class House:
         pr, _band = price_of(self.cfg, hour)
         buy = max(grid, 0.0)
         sell = max(-grid, 0.0)
-        buy0 = max(load - pv, 0.0)
+        buy0 = max(load - pv_resource, 0.0)
         self.today["pv"] += pv * dt_h
         self.today["load"] += load * dt_h
         self.today["buy"] += buy * dt_h
@@ -683,7 +831,7 @@ class House:
             "today": {k: round(v, 3) for k, v in self.today.items()},
             "alarms": self.alarms,
             "cfg": self.cfg,
-            "hist": self.hist[-360:],
+            "hist": self.hist[-1440:],
             "cells": self.pack.snapshot(),
             "plan": self.brain.plan,
             "bal_now": self.brain.bal if self.cfg.get("balance") == "auto" else self.cfg.get("balance"),
@@ -724,7 +872,60 @@ def llm_loop():
             with house.lock:
                 house.brain.accept_llm(cmd, house.cfg["pcs_kw"])
         except Exception:
-            pass
+            with house.lock:
+                house.brain.accept_llm(None, house.cfg["pcs_kw"])
+
+
+_REJECTED = object()
+
+
+def _parse_ctrl(req):
+    out = {}
+    if "mode" in req:
+        if req["mode"] not in ("auto", "self", "tou", "manual", "stop"):
+            raise ValueError("mode")
+        out["mode"] = req["mode"]
+    if "manual" in req:
+        out["manual"] = finite(req["manual"])
+    if "speed" in req:
+        out["speed"] = max(1, min(30, int(finite(req["speed"]))))
+    if "paused" in req:
+        out["paused"] = as_bool(req["paused"])
+    if req.get("newday"):
+        out["newday"] = True
+    if "soc" in req:
+        out["soc"] = max(0.0, min(100.0, finite(req["soc"])))
+    if "cfg" in req:
+        if not isinstance(req["cfg"], dict):
+            raise ValueError("cfg")
+        out["cfg"] = req["cfg"]
+    return out
+
+
+def _apply_ctrl(target, parsed):
+    if "cfg" in parsed:
+        merged = dict(target.cfg)
+        for k, v in parsed["cfg"].items():
+            if k in DEFAULTS:
+                merged[k] = v
+        target.cfg = clamp_cfg(merged)
+        save_cfg(target.cfg)
+    if "mode" in parsed:
+        target.mode = parsed["mode"]
+    if "manual" in parsed:
+        pcs = target.cfg["pcs_kw"]
+        target.manual = max(-pcs, min(pcs, parsed["manual"]))
+    if "speed" in parsed:
+        target.speed = parsed["speed"]
+    if "paused" in parsed:
+        target.paused = parsed["paused"]
+    if parsed.get("newday"):
+        target.now = target.now.replace(hour=0, minute=0, second=0, microsecond=0)
+        target._reset_today(target.now)
+    if "soc" in parsed:
+        target.pack.set_soc(parsed["soc"])
+        target.soc = target.pack.mean_soc()
+        target.temp = target.pack.tmax()
 
 
 MIME = {
@@ -746,8 +947,30 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
         self.wfile.write(data)
+
+    def _read_json(self):
+        raw_n = self.headers.get("Content-Length")
+        if raw_n is None or raw_n == "":
+            n = 0
+        else:
+            try:
+                n = int(raw_n)
+            except ValueError:
+                self._send(400, '{"err":"length"}', MIME[".json"])
+                return _REJECTED
+        if n < 0 or n > 65536:
+            self._send(413, '{"err":"too large"}', MIME[".json"])
+            return _REJECTED
+        raw = self.rfile.read(n) if n else b"{}"
+        try:
+            req = json.loads(raw.decode("utf-8") or "{}")
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            self._send(400, '{"err":"json"}', MIME[".json"])
+            return _REJECTED
+        return {} if req is None else req
 
     def do_GET(self):
         path = urlparse(self.path).path
@@ -782,15 +1005,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = urlparse(self.path).path
-        n = int(self.headers.get("Content-Length") or 0)
-        if n > 65536:
-            self._send(413, '{"err":"too large"}', MIME[".json"])
-            return
-        raw = self.rfile.read(n) if n else b"{}"
-        try:
-            req = json.loads(raw.decode("utf-8") or "{}")
-        except json.JSONDecodeError:
-            self._send(400, '{"err":"json"}', MIME[".json"])
+        req = self._read_json()
+        if req is _REJECTED:
             return
         if path == "/api/llm":
             with house.lock:
@@ -809,52 +1025,32 @@ class Handler(BaseHTTPRequestHandler):
         if path != "/api/ctrl" or not isinstance(req, dict):
             self._send(404, '{"err":"no"}', MIME[".json"])
             return
+        try:
+            parsed = _parse_ctrl(req)
+        except (TypeError, ValueError):
+            self._send(400, '{"err":"number"}', MIME[".json"])
+            return
         with house.lock:
-            if "mode" in req and req["mode"] in ("auto", "self", "tou", "manual", "stop"):
-                house.mode = req["mode"]
-            if "manual" in req:
-                house.manual = max(-house.cfg["pcs_kw"], min(house.cfg["pcs_kw"], float(req["manual"])))
-            if "speed" in req:
-                house.speed = max(1, min(30, int(req["speed"])))
-            if "paused" in req:
-                house.paused = bool(req["paused"])
-            if req.get("newday"):
-                house.now = house.now.replace(hour=0, minute=0, second=0, microsecond=0)
-                house._reset_today(house.now)
-            if "soc" in req:
-                try:
-                    house.pack.set_soc(max(5.0, min(100.0, float(req["soc"]))))
-                    house.soc = house.pack.mean_soc()
-                    house.temp = house.pack.tmax()
-                except (TypeError, ValueError):
-                    pass
-            if "cfg" in req and isinstance(req["cfg"], dict):
-                for k, v in req["cfg"].items():
-                    if k not in DEFAULTS:
-                        continue
-                    try:
-                        if k == "export":
-                            house.cfg[k] = bool(v)
-                        elif k in ("peak", "valley", "balance"):
-                            house.cfg[k] = str(v)
-                        else:
-                            house.cfg[k] = type(DEFAULTS[k])(v)
-                    except (TypeError, ValueError):
-                        pass
-                house.cfg["soc_min"] = min(house.cfg["soc_min"], 80)
-                house.cfg["soc_max"] = max(house.cfg["soc_max"], house.cfg["soc_min"] + 5)
-                if house.cfg.get("balance") not in ("off", "passive", "active", "auto"):
-                    house.cfg["balance"] = "auto"
-                save_cfg(house.cfg)
+            _apply_ctrl(house, parsed)
             house._step(1.0)
             snap = house.snapshot()
         self._send(200, json.dumps(snap, ensure_ascii=False), MIME[".json"])
 
 
-def check():
+class Server(ThreadingHTTPServer):
+    allow_reuse_address = True
+
+
+def _fresh(mode):
     h = House()
-    h.mode = "self"
-    h.now = datetime.now().replace(hour=12, minute=0, second=0, microsecond=0)
+    h.cfg = dict(DEFAULTS)
+    h.mode = mode
+    return h
+
+
+def _check_balance():
+    h = _fresh("self")
+    h.now = datetime(2026, 6, 21, 12, 0, 0)
     h._reset_today(h.now)
     h.pack.set_soc(50)
     h.soc = h.pack.mean_soc()
@@ -864,24 +1060,40 @@ def check():
         bal = h.pv + h.grid + h.batt - h.load
         if abs(bal) > 0.08:
             print("balance", bal, h.pv, h.load, h.batt, h.grid)
-            return 1
-    h2 = House()
-    h2.mode = "self"
+            return 1, None
+    return 0, h
+
+
+def _check_cell():
+    h2 = _fresh("self")
     h2.cfg["balance"] = "passive"
     h2.pack.set_soc(92)
     h2.pack.cells[6]["soc"] = 99.6
     h2.pack.refresh(0.0)
-    p0 = -5.0
-    p1, why = h2.pack.constrain(p0)
+    p1, why = h2.pack.constrain(-5.0)
     if abs(p1) > 1e-6 or "full" not in why:
         print("cell limit fail", p1, why)
-        return 1
+        return 1, ""
+    return 0, why
+
+
+def _check_llm():
     got = llmapi.parse_reply('{"p_kw": -1.5, "why": "off-peak charge", "balance": "passive"}')
     if not got or abs(got["p_kw"] + 1.5) > 1e-6:
         print("llm parse fail", got)
         return 1
-    h3 = House()
-    h3.mode = "auto"
+    fenced = llmapi.parse_reply('note ```json\n{"p_kw": 1.25, "why": "peak", "balance": "sideways"}\n```')
+    if not fenced or abs(fenced["p_kw"] - 1.25) > 1e-9 or fenced["balance"] != "auto":
+        print("llm fence", fenced)
+        return 1
+    if llmapi.parse_reply("no json here") is not None:
+        print("llm junk")
+        return 1
+    return 0
+
+
+def _check_valley():
+    h3 = _fresh("auto")
     h3.cfg["pv_kw"] = 0
     h3.cfg["pcs_kw"] = 1.0
     h3.now = h3.now.replace(hour=23, minute=0, second=0, microsecond=0)
@@ -893,14 +1105,290 @@ def check():
     pv = h3.pv_avail(23)
     load = h3.load_kw(23)
     h3.brain.observe(23, load, pv, h3.cfg)
-    p, _why = h3._decide(pv, load)
+    p, why = h3._decide(pv, load)
     if p > -0.2:
-        print("auto valley charge fail", p, _why)
+        print("auto valley charge fail", p, why)
         return 1
     if not h3.brain.plan or h3.brain.plan[1]["p"] > -0.05:
         print("plan valley fail", h3.brain.plan[:3] if h3.brain.plan else None)
         return 1
-    print("ok", round(h.today["pv"], 2), round(h.soc, 1), why)
+    return 0
+
+
+def _check_hours():
+    cfg = dict(DEFAULTS)
+    expect = (
+        (8, "Peak"),
+        (10.9, "Peak"),
+        (11, "Mid"),
+        (18, "Peak"),
+        (21, "Mid"),
+        (23, "Off-peak"),
+        (0, "Off-peak"),
+        (6.5, "Off-peak"),
+        (7, "Mid"),
+        (12, "Mid"),
+    )
+    for hour, band in expect:
+        got = price_of(cfg, hour)[1]
+        if got != band:
+            print("band", hour, got, band)
+            return 1
+    if in_hours(12, "") or in_hours(12, "nope"):
+        print("hours junk")
+        return 1
+    overlap = dict(DEFAULTS)
+    overlap["peak"] = "0-5"
+    overlap["valley"] = "0-5"
+    if price_of(overlap, 1)[1] != "Peak":
+        print("peak should win overlap")
+        return 1
+    return 0
+
+
+def _check_clamp():
+    c = clamp_cfg({
+        "pv_kw": -1,
+        "batt_kwh": 1000,
+        "pcs_kw": 0,
+        "soc_min": 99,
+        "soc_max": 1,
+        "eta": 2,
+        "export": "false",
+        "price_peak": -3,
+        "price_flat": "x",
+        "price_valley": 1,
+        "peak": "8-11,<script>",
+        "valley": "23-7",
+        "balance": "nope",
+    })
+    if c["pv_kw"] != 0 or c["batt_kwh"] != 100 or abs(c["pcs_kw"] - 0.2) > 1e-9:
+        print("clamp size", c["pv_kw"], c["batt_kwh"], c["pcs_kw"])
+        return 1
+    if c["soc_min"] != 80 or c["soc_max"] < 85:
+        print("clamp soc", c["soc_min"], c["soc_max"])
+        return 1
+    if abs(c["eta"] - 0.99) > 1e-9 or c["export"] or c["price_peak"] != 0:
+        print("clamp eta export price", c["eta"], c["export"], c["price_peak"])
+        return 1
+    if "<" in c["peak"] or c["balance"] != "auto":
+        print("clamp text", c["peak"], c["balance"])
+        return 1
+    if abs(c["price_flat"] - DEFAULTS["price_flat"]) > 1e-9:
+        print("clamp flat", c["price_flat"])
+        return 1
+    if clamp_cfg({"export": "true"})["export"] is not True:
+        print("export true")
+        return 1
+    return 0
+
+
+def _check_window():
+    h = _fresh("manual")
+    h.cfg["soc_min"] = 30
+    h.cfg["soc_max"] = 90
+    h.cfg["pcs_kw"] = 5
+    h.manual = 5
+    h.pack.set_soc(31)
+    h.soc = h.pack.mean_soc()
+    h.now = datetime(2026, 6, 21, 3, 0, 0)
+    h._reset_today(h.now)
+    h.cloud = 0.5
+    for _ in range(8):
+        h._step(60)
+        bal = h.pv + h.grid + h.batt - h.load
+        if abs(bal) > 0.08:
+            print("window balance", bal, h.pv, h.load, h.batt, h.grid)
+            return 1
+    if h.soc < 29.95 or h.soc > 30.4:
+        print("soc min window", h.soc, h.batt, h.reason)
+        return 1
+    h.manual = -1
+    h.cfg["soc_max"] = 60
+    h.pack.set_soc(59)
+    h.soc = h.pack.mean_soc()
+    for _ in range(10):
+        h._step(60)
+        if h.soc > 60.08:
+            print("soc max window", h.soc, h.batt, h.reason)
+            return 1
+    if h.soc < 59.5:
+        print("soc max not reached", h.soc, h.batt, h.reason)
+        return 1
+    return 0
+
+
+def _check_export():
+    h = _fresh("manual")
+    h.cfg["export"] = False
+    h.manual = 1
+    h.pack.set_soc(50)
+    h.soc = h.pack.mean_soc()
+    p, why = h._decide(5, 1)
+    if p < -0.05 or p > 0.05:
+        print("manual surplus", p, why)
+        return 1
+    h.manual = -1
+    p, why = h._decide(5, 1)
+    if p > -0.5:
+        print("manual charge", p, why)
+        return 1
+    h.mode = "self"
+    p, why = h._decide(5, 1)
+    if p > -0.5:
+        print("self surplus", p, why)
+        return 1
+    return 0
+
+
+def _check_curtail():
+    h = _fresh("stop")
+    h.cfg["export"] = False
+    h.cloud = 1.0
+    h.now = datetime(2026, 6, 21, 12, 0, 0)
+    h._reset_today(h.now)
+    h._step(3600)
+    if h.today["cut"] <= 0.2:
+        print("curtail", h.today, h.pv, h.load, h.batt)
+        return 1
+    if h.today["cost0"] > 0.05:
+        print("cost0", h.today, h.pv, h.load)
+        return 1
+    if h.grid < -0.05:
+        print("export leaked", h.grid)
+        return 1
+    bal = h.pv + h.grid + h.batt - h.load
+    if abs(bal) > 0.08:
+        print("curtail balance", bal, h.pv, h.grid, h.batt, h.load)
+        return 1
+    return 0
+
+
+def _check_soc_track():
+    h = _fresh("stop")
+    h.pack.cap_ah = h.cfg["batt_kwh"] * 1000.0 / N_CELL / 3.2
+    eta = h.cfg["eta"]
+    dt = 4.0
+    dt_h = dt / 3600.0
+    for p in (2.0, -2.0):
+        h.pack.set_soc(50)
+        h.pack.refresh(0.0)
+        vpack = h.pack._vpack()
+        inv = sum(1.0 / (h.pack.cap_ah * c["cap"]) for c in h.pack.cells) / N_CELL
+        p_dc = p / eta if p >= 0 else p * eta
+        i_pack = p_dc * 1000.0 / vpack
+        dsoc = -i_pack * dt_h * 100.0 * inv
+        back = h.pack.ac_kw_for_mean_dsoc(dsoc, dt_h, eta)
+        if abs(back - p) > 0.02:
+            print("soc track power", p, back, dsoc)
+            return 1
+        before = h.pack.mean_soc()
+        h.pack.apply(p, dt, "off", eta)
+        after = h.pack.mean_soc()
+        if abs((after - before) - dsoc) > 0.002:
+            print("soc track", p, before, after, dsoc)
+            return 1
+    return 0
+
+
+def _check_http():
+    import http.client
+
+    prev_mode = house.mode
+    prev_manual = house.manual
+    httpd = Server(("127.0.0.1", 0), Handler)
+    port = httpd.server_address[1]
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+
+    def call(method, path, body=None, headers=None):
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=3)
+        conn.request(method, path, body=body, headers=headers or {})
+        resp = conn.getresponse()
+        payload = resp.read()
+        status = resp.status
+        conn.close()
+        return status, payload
+
+    try:
+        status, payload = call("GET", "/../server.py")
+        if status != 404 or payload != b"not found":
+            print("traversal", status, payload[:40])
+            return 1
+        status, payload = call("GET", "/s.css")
+        if status != 200 or b"--bg" not in payload:
+            print("css", status)
+            return 1
+        status, payload = call("GET", "/api/state")
+        if status != 200 or b'"soc"' not in payload or b'"hist"' not in payload:
+            print("state", status, payload[:80])
+            return 1
+        status, _payload = call(
+            "POST",
+            "/api/ctrl",
+            body=b"{}",
+            headers={"Content-Type": "application/json", "Content-Length": "nope"},
+        )
+        if status != 400:
+            print("bad length", status)
+            return 1
+        status, _payload = call(
+            "POST",
+            "/api/ctrl",
+            body=b"{}",
+            headers={"Content-Type": "application/json", "Content-Length": "999999"},
+        )
+        if status != 413:
+            print("too large", status)
+            return 1
+        house.manual = 1.5
+        status, _payload = call(
+            "POST",
+            "/api/ctrl",
+            body=b'{"manual":"nope"}',
+            headers={"Content-Type": "application/json"},
+        )
+        if status != 400 or abs(house.manual - 1.5) > 1e-9:
+            print("bad manual", status, house.manual)
+            return 1
+        status, payload = call(
+            "POST",
+            "/api/ctrl",
+            body=b'{"mode":"stop"}',
+            headers={"Content-Type": "application/json"},
+        )
+        if status != 200 or b'"mode": "stop"' not in payload and b'"mode":"stop"' not in payload:
+            print("mode stop", status, payload[:120])
+            return 1
+        return 0
+    finally:
+        house.mode = prev_mode
+        house.manual = prev_manual
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def check():
+    code, noon = _check_balance()
+    if code:
+        return code
+    code, why = _check_cell()
+    if code:
+        return code
+    for part in (
+        _check_llm,
+        _check_valley,
+        _check_hours,
+        _check_clamp,
+        _check_window,
+        _check_export,
+        _check_curtail,
+        _check_soc_track,
+        _check_http,
+    ):
+        code = part()
+        if code:
+            return code
+    print("ok", round(noon.today["pv"], 2), round(noon.soc, 1), why)
     return 0
 
 
@@ -909,7 +1397,11 @@ if __name__ == "__main__":
         sys.exit(check())
     threading.Thread(target=worker, daemon=True).start()
     threading.Thread(target=llm_loop, daemon=True).start()
-    httpd = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
+    try:
+        httpd = Server(("127.0.0.1", PORT), Handler)
+    except OSError:
+        print(f"Port {PORT} is already in use.", file=sys.stderr)
+        sys.exit(1)
     print(f"Open http://127.0.0.1:{PORT}")
     try:
         httpd.serve_forever()

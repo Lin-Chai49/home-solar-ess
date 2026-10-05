@@ -13,7 +13,8 @@ Large cell spread switches to active balance. You can still use self-use, peak/o
 Size and rates are at the bottom of the page. The bill is an estimate at your rates, not a utility invoice.
 
 Cells are a simulated 16s LFP pack. Charge is limited by the highest cell, discharge by the lowest.
-Cell 7 is weaker on purpose. There is no cloud model and no thermal-runaway probability.
+Cell 7 is weaker on purpose. Cloud cover is a slow random factor, not a weather forecast.
+There is no thermal-runaway probability.
 
 LLM (optional):
     Copy llm.example.json to data/llm.json, set enabled true, fill api_key and model.

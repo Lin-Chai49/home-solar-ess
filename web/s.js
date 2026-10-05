@@ -78,6 +78,7 @@ function fill(s) {
   });
   $("pause").textContent = s.paused ? "Resume" : "Pause";
   $("pause").classList.toggle("on", s.paused);
+  $("pause").setAttribute("aria-pressed", s.paused ? "true" : "false");
   $("manwrap").hidden = s.mode !== "manual";
   $("manual").disabled = s.mode !== "manual";
   const pcs = (s.cfg && s.cfg.pcs_kw) || 5;
@@ -85,15 +86,17 @@ function fill(s) {
   $("manual").max = String(pcs);
   $("manout").textContent = n(s.manual, 1) + " kW";
   const box = $("alarms");
-  box.innerHTML = "";
-  if (s.alarms && s.alarms.length) {
-    s.alarms.forEach((m) => {
+  const nextAlarms = (s.alarms || []).join("\n");
+  if (box.dataset.msg !== nextAlarms) {
+    box.dataset.msg = nextAlarms;
+    box.replaceChildren();
+    (s.alarms || []).forEach((m) => {
       const li = document.createElement("li");
       li.textContent = m;
       box.appendChild(li);
     });
-    box.hidden = false;
-  } else box.hidden = true;
+  }
+  box.hidden = !nextAlarms;
   const bal = $("bal");
   if (Math.abs(s.bal) > 0.1) {
     bal.hidden = false;
@@ -182,41 +185,76 @@ function cells(c, bal, batt, balNow) {
   if (bal && !sel.matches(":focus")) sel.value = bal;
 }
 
+function hhmm(min) {
+  const m = ((min % 1440) + 1440) % 1440;
+  const h = Math.floor(m / 60);
+  const mm = m % 60;
+  return (h < 10 ? "0" : "") + h + ":" + (mm < 10 ? "0" : "") + mm;
+}
+
 function draw(hist) {
   const c = $("chart");
   const x = c.getContext("2d");
-  const w = c.width, h = c.height;
+  if (!x) return;
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const rect = c.getBoundingClientRect();
+  const w = Math.max(rect.width, 280);
+  const h = Math.max(rect.height, 140);
+  const bw = Math.round(w * dpr);
+  const bh = Math.round(h * dpr);
+  if (c.width !== bw || c.height !== bh) {
+    c.width = bw;
+    c.height = bh;
+  }
+  x.setTransform(dpr, 0, 0, dpr, 0, 0);
   x.clearRect(0, 0, w, h);
+  const x0 = 36;
+  const y0 = h - 22;
+  const ww = w - 44;
+  const hh = h - 32;
   x.strokeStyle = "#c5ccc0";
+  x.lineWidth = 1;
   x.beginPath();
-  x.moveTo(28, 8);
-  x.lineTo(28, h - 18);
-  x.lineTo(w - 8, h - 18);
+  x.moveTo(x0, 8);
+  x.lineTo(x0, y0);
+  x.lineTo(w - 8, y0);
   x.stroke();
   if (!hist || hist.length < 2) return;
-  let mx = 0.5;
+  let hi = 0.5;
+  let lo = 0;
   hist.forEach((p) => {
-    mx = Math.max(mx, p[1], p[2], Math.abs(p[3]));
+    hi = Math.max(hi, p[1], p[2], p[3]);
+    lo = Math.min(lo, p[3]);
   });
-  const x0 = 28, y0 = h - 18, ww = w - 36, hh = h - 26;
+  const span = (hi - lo) || 1;
   function X(i) { return x0 + (i / (hist.length - 1)) * ww; }
-  function Y(v) { return y0 - (v / mx) * hh; }
+  function Y(v) { return y0 - ((v - lo) / span) * hh; }
+  if (lo < -0.05) {
+    x.beginPath();
+    x.moveTo(x0, Y(0));
+    x.lineTo(w - 8, Y(0));
+    x.stroke();
+  }
   function line(idx, color) {
     x.strokeStyle = color;
+    x.lineWidth = 1.5;
     x.beginPath();
     hist.forEach((p, i) => {
-      const y = Y(idx === 3 ? Math.abs(p[3]) : p[idx]);
+      const y = Y(p[idx]);
       if (i === 0) x.moveTo(X(i), y);
       else x.lineTo(X(i), y);
     });
     x.stroke();
   }
   line(1, "#8a6a12");
-  line(3, "#2d6a4f");
   line(2, "#2c3230");
+  line(3, "#2d6a4f");
   x.fillStyle = "#5b675f";
   x.font = "11px sans-serif";
-  x.fillText(mx.toFixed(1) + " kW", 2, 14);
+  x.fillText(hi.toFixed(1), 2, 14);
+  if (lo < -0.05) x.fillText(lo.toFixed(1), 2, y0);
+  x.fillText(hhmm(hist[0][0]), x0, h - 6);
+  x.fillText(hhmm(hist[hist.length - 1][0]), Math.max(x0 + 48, w - 44), h - 6);
 }
 
 async function get() {
@@ -235,22 +273,32 @@ async function post(body) {
   return r.json();
 }
 
+function send(body) {
+  return post(body).then(fill).catch(() => {
+    $("say").textContent = "No data. Check that the program is running.";
+  });
+}
+
 document.querySelectorAll("[data-mode]").forEach((b) => {
-  b.onclick = () => post({ mode: b.dataset.mode }).then(fill);
+  b.onclick = () => send({ mode: b.dataset.mode });
 });
-$("pause").onclick = () => post({ paused: !(last && last.paused) }).then(fill);
-$("speed").onchange = () => post({ speed: Number($("speed").value) }).then(fill);
-$("newday").onclick = () => post({ newday: true }).then(fill);
-$("balance").onchange = () => post({ cfg: { balance: $("balance").value } }).then(fill);
+$("pause").onclick = () => send({ paused: !(last && last.paused) });
+$("speed").onchange = () => send({ speed: Number($("speed").value) });
+$("newday").onclick = () => send({ newday: true });
+$("balance").onchange = () => send({ cfg: { balance: $("balance").value } });
 $("manual").oninput = () => {
   $("manout").textContent = n(Number($("manual").value), 1) + " kW";
 };
-$("manual").onchange = () => post({ manual: Number($("manual").value) }).then(fill);
+$("manual").onchange = () => send({ manual: Number($("manual").value) });
 
 const form = $("form");
+const socInput = form.querySelector('input[name="soc"]');
+let socTouched = false;
+if (socInput) socInput.addEventListener("input", () => { socTouched = true; });
+
 function cfgToForm(cfg) {
   [...form.elements].forEach((el) => {
-    if (!el.name) return;
+    if (!el.name || el.name === "soc") return;
     if (el.type === "checkbox") el.checked = !!cfg[el.name];
     else if (cfg[el.name] != null) el.value = cfg[el.name];
   });
@@ -261,31 +309,59 @@ form.onsubmit = (e) => {
   let soc = null;
   [...form.elements].forEach((el) => {
     if (!el.name) return;
-    if (el.name === "soc") { soc = Number(el.value); return; }
+    if (el.name === "soc") {
+      if (socTouched) soc = Number(el.value);
+      return;
+    }
     if (el.type === "checkbox") cfg[el.name] = el.checked;
     else if (el.type === "number") cfg[el.name] = Number(el.value);
     else cfg[el.name] = el.value;
   });
-  post({ cfg, soc }).then(fill);
+  const body = { cfg };
+  if (soc != null && !Number.isNaN(soc)) body.soc = soc;
+  post(body).then((s) => {
+    cfgToForm(s.cfg);
+    socTouched = false;
+    if (socInput) socInput.value = s.soc;
+    fill(s);
+  }).catch(() => {
+    $("say").textContent = "Settings were not saved. Check that the program is running.";
+  });
 };
 
 async function tick() {
   try {
     const s = await get();
-    if (!$("speed").matches(":focus")) $("speed").value = String(s.speed);
+    if (!$("speed").matches(":focus")) {
+      const speed = String(s.speed);
+      if ([...$("speed").options].some((o) => o.value === speed)) $("speed").value = speed;
+    }
     if (!$("manual").matches(":active")) {
       const cur = Number($("manual").value);
       if (Math.abs(cur - s.manual) > 0.05) $("manual").value = s.manual;
     }
     if (!form.dataset.ready) {
       cfgToForm(s.cfg);
-      if (form.soc) form.soc.value = s.soc;
       form.dataset.ready = "1";
+    }
+    if (socInput && document.activeElement !== socInput && !socTouched) {
+      socInput.value = s.soc;
     }
     fill(s);
   } catch (err) {
     $("say").textContent = "No data. Check that the program is running.";
   }
 }
+let pollMs = 700;
+let poll = setInterval(tick, pollMs);
+function setPoll(ms) {
+  if (ms === pollMs) return;
+  pollMs = ms;
+  clearInterval(poll);
+  poll = setInterval(tick, pollMs);
+}
+document.addEventListener("visibilitychange", () => {
+  setPoll(document.hidden ? 4000 : 700);
+  if (!document.hidden) tick();
+});
 tick();
-setInterval(tick, 700);
