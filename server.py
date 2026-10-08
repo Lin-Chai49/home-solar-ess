@@ -188,23 +188,88 @@ class Pack:
         for c in self.cells:
             c["v"] = lfp_v(c["soc"]) - i_pack * c["r"]
 
+    def _limit_power(self, p_kw, eta, v_stop):
+        """Largest share of p_kw that keeps every cell on the safe side of v_stop.
+
+        Returns (power, index of the cell that set it). A cell already past
+        v_stop at rest yields 0. Power that already fits is unchanged.
+        """
+        if abs(p_kw) < 1e-9:
+            return p_kw, None
+        eta = min(0.99, max(0.5, float(eta)))
+        vpack = self._vpack()
+        limit = p_kw
+        who = None
+        if p_kw < 0:
+            for i, c in enumerate(self.cells):
+                ocv = lfp_v(c["soc"])
+                if ocv >= v_stop or c["r"] <= 0:
+                    return 0.0, i
+                cap_p = (ocv - v_stop) * vpack / (eta * 1000.0 * c["r"])
+                if cap_p > limit:
+                    limit = cap_p
+                    who = i
+            if limit >= -1e-6:
+                return 0.0, who
+            return limit, who
+        for i, c in enumerate(self.cells):
+            ocv = lfp_v(c["soc"])
+            if ocv <= v_stop or c["r"] <= 0:
+                return 0.0, i
+            cap_p = (ocv - v_stop) * eta * vpack / (1000.0 * c["r"])
+            if cap_p < limit:
+                limit = cap_p
+                who = i
+        if limit <= 1e-6:
+            return 0.0, who
+        return limit, who
+
     def constrain(self, p_kw, eta=0.96):
+        eta = min(0.99, max(0.5, float(eta)))
+        asked = float(p_kw)
+        taper = False
+        who = None
+        if asked < -1e-9:
+            hard, hard_i = self._limit_power(asked, eta, V_HI - 0.002)
+            soft, soft_i = self._limit_power(hard, eta, V_HI_SOFT)
+            # Already above the soft voltage at rest: creep, do not sit on the hard stop.
+            if hard < -1e-4 and soft > -1e-4:
+                p_kw, who, taper = hard * 0.35, hard_i, True
+            else:
+                p_kw, who = soft, soft_i
+        elif asked > 1e-9:
+            hard, hard_i = self._limit_power(asked, eta, V_LO + 0.002)
+            soft, soft_i = self._limit_power(hard, eta, V_LO_SOFT)
+            if hard > 1e-4 and soft < 1e-4:
+                p_kw, who, taper = hard * 0.35, hard_i, True
+            else:
+                p_kw, who = soft, soft_i
+        else:
+            p_kw = 0.0
         self.refresh(self._current(p_kw, eta))
         hi = max(self.cells, key=lambda c: c["v"])
         lo = min(self.cells, key=lambda c: c["v"])
         ih = self.cells.index(hi) + 1
         il = self.cells.index(lo) + 1
+        # A cell already on the stop makes the fitted power 0, so the request
+        # direction has to be remembered to name that stop.
+        if asked < -1e-6 and p_kw > -1e-4 and hi["v"] >= V_HI - 0.005:
+            return 0.0, f"Cell {ih} is full ({hi['v']:.3f} V). Charge stopped."
+        if asked > 1e-6 and p_kw < 1e-4 and lo["v"] <= V_LO + 0.005:
+            return 0.0, f"Cell {il} is empty ({lo['v']:.3f} V). Discharge stopped."
         if p_kw < -1e-6 and hi["v"] >= V_HI:
             return 0.0, f"Cell {ih} is full ({hi['v']:.3f} V). Charge stopped."
         if p_kw > 1e-6 and lo["v"] <= V_LO:
             return 0.0, f"Cell {il} is empty ({lo['v']:.3f} V). Discharge stopped."
         why = ""
-        if p_kw < -1e-6 and hi["v"] >= V_HI_SOFT:
-            p_kw *= 0.35
-            why = f"Cell {ih} is high. Charge derated."
-        elif p_kw > 1e-6 and lo["v"] <= V_LO_SOFT:
-            p_kw *= 0.35
-            why = f"Cell {il} is low. Discharge derated."
+        if who is not None and asked < -1e-6 and p_kw < -1e-4:
+            ocv = lfp_v(self.cells[who]["soc"])
+            if taper or ocv >= V_HI_SOFT - 0.04:
+                why = f"Cell {who + 1} is high. Charge derated."
+        elif who is not None and asked > 1e-6 and p_kw > 1e-4:
+            ocv = lfp_v(self.cells[who]["soc"])
+            if taper or ocv <= V_LO_SOFT + 0.04:
+                why = f"Cell {who + 1} is low. Discharge derated."
         ht = self.tmax()
         if ht >= 52:
             return 0.0, "A cell is too hot. Charge and discharge stopped."
@@ -396,18 +461,25 @@ class Brain:
             f_load.append(self.load_hat[int(h) % 24])
             f_band.append(price_of(cfg, h)[1])
         f_pv[0], f_load[0] = pv, load
-        p, why = self._intent(0, h0, f_pv, f_load, f_band, soc, cfg)
+        p_now, p_hour, why = self._intent(0, h0, f_pv, f_load, f_band, soc, cfg)
         if self.llm_on and self._llm_p is not None:
-            p = max(-pcs, min(pcs, self._llm_p))
+            p_now = max(-pcs, min(pcs, self._llm_p))
+            p_hour = p_now
             why = self._llm_why
-        self.plan = self._roll(h0, soc, p, f_pv, f_load, f_band, cfg)
-        return p, why
+        self.plan = self._roll(h0, soc, p_hour, f_pv, f_load, f_band, cfg)
+        return p_now, why
 
     def _intent(self, i, h0, f_pv, f_load, f_band, soc, cfg):
+        """Return (power now, one-hour average, reason).
+
+        Power now follows the inverter and the house. Leftover kWh is not a
+        kW cap. The hour average is also limited to the energy that hour can
+        spend, so one bar does not use the evening reserve all at once.
+        """
         pcs = cfg["pcs_kw"]
         mn, mx = cfg["soc_min"], cfg["soc_max"]
         cap = max(cfg["batt_kwh"], 0.1)
-        eta = max(cfg["eta"], 0.5)
+        eta = min(0.99, max(0.5, float(cfg["eta"])))
         n = len(f_pv)
         peak_need = 0.0
         pv_before_peak = 0.0
@@ -426,46 +498,40 @@ class Brain:
         net = f_load[i] - f_pv[i]
         band = f_band[i]
 
+        def clip(p):
+            return max(-pcs, min(pcs, p))
+
         if net < -0.05:
-            p = max(-pcs, net, -max(room, 0.0))
-            if p < -0.05:
-                why = "Solar surplus. Store it in the battery first."
-            else:
-                why = "Battery is full. Not storing more."
-        elif band == "Peak":
+            if room <= 0.05:
+                return 0.0, 0.0, "Battery is full. Not storing more."
+            p_now = clip(net)
+            p_hour = clip(max(p_now, -(max(room, 0.0) / eta)))
+            return p_now, p_hour, "Solar surplus. Store it in the battery first."
+        if band == "Peak":
             if net > 0.05:
-                p = min(pcs, net, max(avail, 0.0))
-                if p > 0.05:
-                    why = "Peak rate. Use the battery to cover the house."
-                else:
-                    why = "Peak rate. Battery is at its minimum, so the house stays on the grid."
-            else:
-                p = max(-pcs, net, -max(room, 0.0))
-                why = "Peak rate. Load and solar are about even."
-        elif band == "Off-peak":
+                if avail <= 0.05:
+                    return 0.0, 0.0, "Peak rate. Battery is at its minimum, so the house stays on the grid."
+                p_now = clip(net)
+                p_hour = clip(min(p_now, max(avail, 0.0) * eta))
+                return p_now, p_hour, "Peak rate. Use the battery to cover the house."
+            return 0.0, 0.0, "Peak rate. Load and solar are about even."
+        if band == "Off-peak":
             reserve = min(peak_need / eta, (mx - mn) / 100.0 * cap)
             need_grid = reserve - avail - 0.85 * pv_before_peak
             if need_grid > 0.2 and room > 0.1:
-                p = -min(pcs, need_grid, room)
-                why = "Off-peak, and evening peak still needs energy. Charge cheap now."
-            elif pv_before_peak > 1:
-                p = 0.0
-                why = "Off-peak. Daytime solar can fill the battery, so skip grid charge."
-            else:
-                p = 0.0
-                why = "Off-peak. Enough energy for evening peak. Battery stands by."
-        else:
-            keep = peak_need / eta
-            if net > 0.05 and avail > keep + 0.3:
-                p = min(pcs, net, avail - keep)
-                if p > 0.05:
-                    why = "Mid rate. Use the battery for the house, keep some for peak."
-                else:
-                    why = "Mid rate. Holding the reserve for evening peak."
-            else:
-                p = 0.0
-                why = "Mid rate. Hold charge for peak. House on the grid."
-        return max(-pcs, min(pcs, p)), why
+                p_now = clip(-pcs)
+                hour_cap = min(pcs, max(need_grid, 0.0) / eta, max(room, 0.0) / eta)
+                return p_now, clip(-hour_cap), "Off-peak, and evening peak still needs energy. Charge cheap now."
+            if pv_before_peak > 1:
+                return 0.0, 0.0, "Off-peak. Daytime solar can fill the battery, so skip grid charge."
+            return 0.0, 0.0, "Off-peak. Enough energy for evening peak. Battery stands by."
+        keep = peak_need / eta
+        spare = avail - keep
+        if net > 0.05 and spare > 0.3:
+            p_now = clip(net)
+            p_hour = clip(min(p_now, max(spare, 0.0) * eta))
+            return p_now, p_hour, "Mid rate. Use the battery for the house, keep some for peak."
+        return 0.0, 0.0, "Mid rate. Hold charge for peak. House on the grid."
 
     def _roll(self, h0, soc, p0, f_pv, f_load, f_band, cfg):
         cap = max(cfg["batt_kwh"], 0.1)
@@ -474,11 +540,11 @@ class Brain:
         out = []
         s = soc
         for i in range(12):
-            p, _ = self._intent(i, h0, f_pv, f_load, f_band, s, cfg)
+            _now, p, _why = self._intent(i, h0, f_pv, f_load, f_band, s, cfg)
             if i == 0:
                 p = p0
-            # One bar is one hour. Clip to the energy the window can take,
-            # and do not draw a discharge the export setting would refuse.
+            # One bar is one hour. The hour value already keeps the evening
+            # reserve. Clip again to the inverter, export, and the SOC window.
             p = _clip_hour(p, f_pv[i], f_load[i], s, cfg)
             if p > 0:
                 s -= p / eta / cap * 100.0
@@ -758,9 +824,27 @@ class House:
             left -= chunk
 
     def _step(self, dt_s):
+        """Advance the house. A step that crosses midnight splits today's totals."""
+        if dt_s <= 0:
+            return
+        end = self.now + timedelta(seconds=dt_s)
+        midnight = datetime.combine(end.date(), datetime.min.time())
+        if self.day == self.now.date() and self.now < midnight <= end:
+            self._apply_interval((midnight - self.now).total_seconds())
+            self._reset_today(midnight)
+            self.now = midnight
+            rest = (end - midnight).total_seconds()
+            if rest > 1e-6:
+                self._apply_interval(rest)
+            return
+        if end.date() != self.day:
+            self._reset_today(end)
+        self._apply_interval(dt_s)
+
+    def _apply_interval(self, dt_s):
+        if dt_s <= 0:
+            return
         t = self.now + timedelta(seconds=dt_s)
-        if t.date() != self.day:
-            self._reset_today(t)
         self.now = t
         hour = t.hour + t.minute / 60.0 + t.second / 3600.0
         self.cloud = min(1.0, max(0.45, self.cloud + random.uniform(-0.012, 0.012)))
@@ -1071,8 +1155,11 @@ class Handler(BaseHTTPRequestHandler):
             if not house.paused:
                 house._step(1.0)
             else:
-                hour = house.now.hour + house.now.minute / 60.0
-                _p, why = house._decide(house.pv_avail(hour), house.load_kw(hour))
+                hour = house.now.hour + house.now.minute / 60.0 + house.now.second / 3600.0
+                # Keep the load already on screen. A new random sample would
+                # move the Auto plan while the clock is paused.
+                load = house.load if house.load > 0 else house.load_kw(hour)
+                _p, why = house._decide(house.pv_avail(hour), load)
                 house.reason = why
             snap = house.snapshot()
         self._send(200, json.dumps(snap, ensure_ascii=False), MIME[".json"])
@@ -1114,6 +1201,28 @@ def _check_cell():
     p1, why = h2.pack.constrain(-5.0)
     if abs(p1) > 1e-6 or "full" not in why:
         print("cell limit fail", p1, why)
+        return 1, ""
+    h3 = _fresh("stop")
+    h3.pack.set_soc(50)
+    h3.pack.cells[0]["soc"] = 96
+    h3.pack.cells[0]["r"] = 0.008
+    p_fit, why_fit = h3.pack.constrain(-5.0)
+    h3.pack.refresh(h3.pack._current(p_fit, h3.cfg["eta"]))
+    if not (-4.9 < p_fit < -0.05) or h3.pack.vmax() > V_HI + 1e-3:
+        print("cell cutback", p_fit, why_fit, h3.pack.vmax())
+        return 1, ""
+    h3.pack.set_soc(40)
+    h3.pack.cells[0]["soc"] = 3
+    h3.pack.cells[0]["r"] = 0.01
+    p_lo, why_lo = h3.pack.constrain(5.0)
+    h3.pack.refresh(h3.pack._current(p_lo, h3.cfg["eta"]))
+    if not (0.05 < p_lo < 4.9) or h3.pack.vmin() < V_LO - 1e-3:
+        print("cell discharge cutback", p_lo, why_lo, h3.pack.vmin())
+        return 1, ""
+    h3.pack.cells[0]["soc"] = 0.2
+    p0, why0 = h3.pack.constrain(5.0)
+    if abs(p0) > 1e-6 or "empty" not in why0:
+        print("cell empty", p0, why0)
         return 1, ""
     return 0, why
 
@@ -1518,6 +1627,139 @@ def _check_http():
         httpd.server_close()
 
 
+def _check_headroom():
+    """Near the window, live power follows the house. The hour bar stays inside the energy."""
+    h = _fresh("auto")
+    h.cfg["pv_kw"] = 0
+    h.cfg["pcs_kw"] = 5
+    h.cfg["eta"] = 0.96
+    h.cloud = 0
+    h.brain.cloud_hat = 0
+    h.brain.load_hat = [0.2] * 24
+    h.now = datetime(2026, 6, 21, 19, 0, 0)
+    h._reset_today(h.now)
+    h.pack.set_soc(20)
+    h.soc = h.pack.mean_soc()
+    p, why = h._decide(0.0, 2.0)
+    bar = h.brain.plan[0]["p"] if h.brain.plan else None
+    avail = max(0.0, (h.soc - h.cfg["soc_min"]) / 100.0 * h.cfg["batt_kwh"])
+    if p < 1.5 or "cover the house" not in why:
+        print("peak live", p, why, h.soc)
+        return 1
+    if bar is None or bar < 0 or bar > avail * h.cfg["eta"] + 0.05 or bar > p - 0.5:
+        print("peak bar", bar, avail, p)
+        return 1
+    h._step(60)
+    bal = h.pv + h.grid + h.batt - h.load
+    if h.soc < h.cfg["soc_min"] - 0.05 or h.batt < 1.2 or abs(bal) > 0.08:
+        print("peak step", h.soc, h.batt, bal, h.reason)
+        return 1
+
+    h = _fresh("auto")
+    h.cfg["pcs_kw"] = 5
+    h.cfg["eta"] = 0.96
+    h.now = datetime(2026, 6, 21, 12, 0, 0)
+    h._reset_today(h.now)
+    h.pack.set_soc(93)
+    h.soc = h.pack.mean_soc()
+    h.cloud = 1
+    h.brain.cloud_hat = 1
+    p, why = h._decide(4.0, 0.5)
+    bar = h.brain.plan[0]["p"] if h.brain.plan else None
+    room = max(0.0, (h.cfg["soc_max"] - h.soc) / 100.0 * h.cfg["batt_kwh"])
+    if p > -2.0 or "Store it" not in why:
+        print("surplus live", p, why, h.soc)
+        return 1
+    if bar is None or bar < -(room / h.cfg["eta"]) - 0.05 or bar > -0.05 or bar < p + 0.5:
+        print("surplus bar", bar, room, p)
+        return 1
+    h._step(60)
+    bal = h.pv + h.grid + h.batt - h.load
+    if h.soc > h.cfg["soc_max"] + 0.05 or h.batt > -0.3 or abs(bal) > 0.08 or h.pack.vmax() > V_HI + 1e-3:
+        print("surplus step", h.soc, h.batt, bal, h.pv, h.load, h.reason, h.pack.vmax())
+        return 1
+
+    h = _fresh("auto")
+    h.cfg["pv_kw"] = 0
+    h.cfg["pcs_kw"] = 5
+    h.cfg["eta"] = 0.96
+    h.cloud = 0
+    h.brain.cloud_hat = 0
+    h.brain.load_hat = [0.2] * 24
+    for hour in (18, 19, 20):
+        h.brain.load_hat[hour] = 1.0
+    h.now = datetime(2026, 6, 21, 23, 0, 0)
+    h._reset_today(h.now)
+    h.pack.set_soc(40)
+    h.soc = h.pack.mean_soc()
+    p, why = h._decide(0.0, 0.3)
+    bar = h.brain.plan[0]["p"] if h.brain.plan else None
+    if p > -4.5 or "cheap" not in why:
+        print("offpeak live", p, why, h.soc)
+        return 1
+    if bar is None or bar > -0.2 or bar < -1.2:
+        print("offpeak bar", bar, p)
+        return 1
+
+    h = _fresh("auto")
+    h.cfg["pv_kw"] = 0
+    h.cfg["pcs_kw"] = 5
+    h.cfg["eta"] = 0.96
+    h.cloud = 0
+    h.brain.cloud_hat = 0
+    h.brain.load_hat = [0.2] * 24
+    for hour in (18, 19, 20):
+        h.brain.load_hat[hour] = 1.0
+    h.now = datetime(2026, 6, 21, 12, 0, 0)
+    h._reset_today(h.now)
+    h.pack.set_soc(50)
+    h.soc = h.pack.mean_soc()
+    p, why = h._decide(0.0, 2.0)
+    bar = h.brain.plan[0]["p"] if h.brain.plan else None
+    if p < 1.5 or "keep some" not in why:
+        print("mid live", p, why, h.soc)
+        return 1
+    if bar is None or bar < 0 or bar > 0.6 or bar > p - 0.5:
+        print("mid bar", bar, p, h.brain.plan[0] if h.brain.plan else None)
+        return 1
+    if h.brain.plan[0]["soc"] < 45:
+        print("mid reserve", h.brain.plan[0])
+        return 1
+    return 0
+
+
+def _check_midnight():
+    h = _fresh("stop")
+    h.cloud = 0
+    h.now = datetime(2026, 6, 21, 23, 59, 30)
+    h._reset_today(h.now)
+    h._step(60)
+    if h.now != datetime(2026, 6, 22, 0, 0, 30) or h.day != h.now.date():
+        print("midnight clock", h.now, h.day)
+        return 1
+    # 30 seconds after midnight, not the whole minute that started yesterday.
+    if not (0.0015 < h.today["load"] < 0.0045):
+        print("midnight load", h.today["load"])
+        return 1
+    if h.today["pv"] > 0.01:
+        print("midnight pv", h.today["pv"])
+        return 1
+    bal = h.pv + h.grid + h.batt - h.load
+    if abs(bal) > 0.08:
+        print("midnight balance", bal, h.pv, h.load, h.batt, h.grid)
+        return 1
+    h = _fresh("stop")
+    h.cloud = 0
+    h.now = datetime(2026, 6, 21, 23, 59, 0)
+    h._reset_today(h.now)
+    before = h.soc
+    h._step(60)
+    if h.now != datetime(2026, 6, 22, 0, 0, 0) or h.today["load"] > 0.0001:
+        print("midnight exact", h.now, h.today["load"], h.soc, before)
+        return 1
+    return 0
+
+
 def check():
     code, noon = _check_balance()
     if code:
@@ -1535,6 +1777,8 @@ def check():
         _check_curtail,
         _check_soc_track,
         _check_plan,
+        _check_headroom,
+        _check_midnight,
         _check_manual_limit,
         _check_http,
     ):

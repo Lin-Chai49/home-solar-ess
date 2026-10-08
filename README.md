@@ -56,7 +56,7 @@ Sanity check for the physics and a few dispatch cases:
 python3 server.py check
 ```
 
-That command should print a line starting with `ok` and exit 0. It checks power balance, the SOC window, cell cutoff, off-peak charging, export curtailment, hour ranges, the 12-hour plan, a paused save, and the local HTTP paths. The same check runs on Python 3.9, 3.12, and 3.14 in GitHub Actions.
+That command should print a line starting with `ok` and exit 0. It checks power balance, the SOC window, cell cutoff, off-peak charging, export curtailment, hour ranges, the 12-hour plan, near-empty and near-full Auto power, a midnight rollover, a paused save, and the local HTTP paths. The same check runs on Python 3.9, 3.12, and 3.14 in GitHub Actions.
 
 ---
 
@@ -104,18 +104,18 @@ If that residual is more than 0.1 kW, the page shows it. The four tiles on the p
 | **Auto** (default) | Looks ~24 hours ahead at solar, load, and rates, then picks this tick’s charge/discharge. Same rules fill the 12-hour plan. |
 | **Self-use** | Drive battery power toward `load − solar` so the grid stays near zero. The 12-hour plan is cleared. |
 | **Peak / off-peak** | Charge from the grid in off-peak hours until the max SOC; cover the house from the battery in peak hours. The 12-hour plan is cleared. |
-| **Manual** | A slider sets battery kW. The slider and the stored setpoint both follow inverter kW. The 12-hour plan is cleared. |
+| **Manual** | A slider sets battery kW. The slider and the stored setpoint both follow inverter kW. The label says charge or discharge. The 12-hour plan is cleared. |
 | **Stop** | Battery kW = 0. The house takes solar and grid only. The 12-hour plan is cleared. |
 
 Auto is not a neural net. It is a small lookahead:
 
 - Surplus solar is stored first.
 - At **peak**, the battery covers the house if it has energy.
-- At **off-peak**, it buys from the grid **only if** the coming evening peak (about 17:30–22:00) would still be short after leftover daytime solar. If daytime sun can fill the pack, it does **not** buy cheap grid power at 1 a.m.
+- At **off-peak**, it buys from the grid **only if** the coming evening peak (about 17:30–22:00) would still be short after leftover daytime solar. It then charges at the inverter limit. The plan bar for that hour stays inside the energy still missing. If daytime sun can fill the pack, it does **not** buy cheap grid power at 1 a.m.
 - At **mid** rate, it may use the battery for the house but keeps a reserve for evening peak.
 - At the SOC limits the status says the battery is full or empty. It does not claim a charge or discharge when the power for that step is about zero.
 
-Each plan bar is one hour. It is clipped to the inverter, to the energy the SOC window can still take that hour, and to the export rule. With export off, a bar does not show a discharge into the grid. Self-use, peak/off-peak, manual, and stop leave the bars empty and say the plan is drawn in Auto.
+Each plan bar is one hour. It is clipped to the inverter, to the energy the SOC window can still take that hour, and to the export rule. The bar is that hour’s average, so near empty or full it can be lower than the power right now. A mid-rate bar also keeps the energy held for evening peak. With export off, a bar does not show a discharge into the grid. Self-use, peak/off-peak, manual, and stop leave the bars empty and say the plan is drawn in Auto.
 
 If an LLM is configured, Auto may use the model’s `p_kw` for this tick. The SOC window, inverter limit, and cell limits still apply after that. The plan bar for that hour is clipped the same way.
 
@@ -129,7 +129,7 @@ Demo speed:
 
 **Restart today** sets the clock to 00:00 of the simulated day and zeros today’s energy counters. It does **not** wipe cell imbalance.
 
-Saving system size or rates does not rewind the battery. The “Charge now” box is sent only after you edit it. A control change while paused does not move the simulated clock or the pack. It does refresh the status line and, in Auto, the plan. Lowering inverter kW pulls the manual setpoint back inside the new limit.
+Saving system size or rates does not rewind the battery. The “Charge now” box is sent only after you edit it. A control change while paused does not move the simulated clock or the pack. It does refresh the status line and, in Auto, the plan, using the solar and load already on screen. Lowering inverter kW pulls the manual setpoint back inside the new limit. A step that crosses midnight keeps only the later part in today’s energy and bill.
 
 ---
 
@@ -146,10 +146,10 @@ The pack is **16 cells in series**, lithium iron phosphate, household 48 V class
 
 | | Voltage | Action |
 |---|---|---|
-| Hard high | 3.55 V | Charge to 0 |
-| Soft high | 3.48 V | Charge × 0.35 |
-| Soft low | 2.95 V | Discharge × 0.35 |
-| Hard low | 2.70 V | Discharge to 0 |
+| Hard high | 3.55 V | Charge is cut back so the cell does not pass this voltage. Already there with no current: charge goes to 0 |
+| Soft high | 3.48 V | Charge is held at this voltage. A cell already this high with no current is charged at × 0.35 |
+| Soft low | 2.95 V | Discharge is held at this voltage. A cell already this low with no current is discharged at × 0.35 |
+| Hard low | 2.70 V | Discharge is cut back so the cell does not pass this voltage. Already there with no current: discharge goes to 0 |
 | Heat | ≥ 45 °C derate, ≥ 52 °C stop | Hottest cell |
 
 Charge is limited by the **highest** cell; discharge by the **lowest**. That is the usual BMS rule: the pack is only as strong as the worst cell.

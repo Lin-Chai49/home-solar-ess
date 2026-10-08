@@ -7,10 +7,27 @@ function n(v, d) {
   return Number(v).toFixed(d);
 }
 
+function limited(reason) {
+  if (!reason) return false;
+  const r = reason.toLowerCase();
+  return r.includes("stopped") || r.includes("derated") || r.includes("curtailed")
+    || r.includes("too hot") || r.includes("is full") || r.includes("is empty")
+    || r.includes("is high") || r.includes("is low") || r.includes("minimum charge")
+    || r.includes("maximum charge") || r.includes("battery full");
+}
+
+function powerWords(v) {
+  const x = Number(v);
+  if (Number.isNaN(x)) return "--";
+  if (x > 0.05) return "discharge " + n(x, 1) + " kW";
+  if (x < -0.05) return "charge " + n(-x, 1) + " kW";
+  return "0 kW";
+}
+
 function say(s) {
   const pv = s.pv, load = s.load, batt = s.batt, grid = s.grid;
   if (s.mode === "stop") return "Stopped.";
-  if (s.mode === "auto" && s.reason) return s.reason;
+  if (s.reason && (s.mode === "auto" || limited(s.reason))) return s.reason;
   if (batt < -0.08 && grid > 0.08) return `Charging the battery from the grid at ${n(-batt,1)} kW. The house is also on the grid.`;
   if (batt < -0.08) return `Solar ${n(pv,1)} kW, home ${n(load,1)} kW. Surplus is charging the battery at ${n(-batt,1)} kW.`;
   if (batt > 0.08) {
@@ -85,7 +102,7 @@ function fill(s) {
   $("manual").min = String(-pcs);
   $("manual").max = String(pcs);
   if (document.activeElement !== $("manual")) $("manual").value = String(s.manual);
-  $("manout").textContent = n(s.manual, 1) + " kW";
+  $("manout").textContent = powerWords(s.manual);
   const box = $("alarms");
   const nextAlarms = (s.alarms || []).join("\n");
   if (box.dataset.msg !== nextAlarms) {
@@ -295,7 +312,7 @@ $("speed").onchange = () => send({ speed: Number($("speed").value) });
 $("newday").onclick = () => send({ newday: true });
 $("balance").onchange = () => send({ cfg: { balance: $("balance").value } });
 $("manual").oninput = () => {
-  $("manout").textContent = n(Number($("manual").value), 1) + " kW";
+  $("manout").textContent = powerWords($("manual").value);
 };
 $("manual").onchange = () => send({ manual: Number($("manual").value) });
 
