@@ -174,19 +174,21 @@ function cells(c, bal, batt, balNow) {
   $("vmin").textContent = n(c.vmin, 3);
   $("dv").textContent = String(c.dv_mv);
   $("nbal").textContent = String(c.nbal);
-  if (c.nbal && batt < -0.3 && c.dv_mv >= 40) {
-    $("cell-say").textContent = `Spread ${c.dv_mv} mV. Charge current is much larger than balance current, so the spread widens first and closes near full or idle.`;
+  const ocv = c.ocv_dv_mv == null ? c.dv_mv : c.ocv_dv_mv;
+  const loaded = c.dv_mv - ocv >= 20 && c.dv_mv >= 40;
+  if (c.nbal && batt < -0.3 && loaded) {
+    $("cell-say").textContent = `Loaded spread ${c.dv_mv} mV, open-circuit spread ${ocv} mV. Balance follows the open-circuit gap. Charge current is still much larger, so the loaded spread stays wide.`;
   } else if (c.nbal) {
-    $("cell-say").textContent = `Spread ${c.dv_mv} mV, balancing. Charge is limited by cell ${c.hi}, discharge by cell ${c.lo}.`;
+    $("cell-say").textContent = `Open-circuit spread ${ocv} mV, balancing. Loaded spread is ${c.dv_mv} mV. Charge is limited by cell ${c.hi}, discharge by cell ${c.lo}.`;
+  } else if (loaded) {
+    $("cell-say").textContent = `Loaded spread ${c.dv_mv} mV, open-circuit spread ${ocv} mV. The extra millivolts are resistance under current. Balance uses the open-circuit gap.`;
   } else if (c.odd && c.odd.length) {
     $("cell-say").textContent = `Cell ${c.odd.join(", ")} differs from the rest. High is cell ${c.hi} at ${n(c.vmax,3)} V, low is cell ${c.lo} at ${n(c.vmin,3)} V.`;
   } else {
     $("cell-say").textContent = `16-cell LFP. High cell ${c.hi}, low cell ${c.lo}, spread ${c.dv_mv} mV. Cell 7 is weaker on purpose.`;
   }
-  if (bal === "auto" && balNow) {
-    if (c.nbal || c.dv_mv >= 25) {
-      $("cell-say").textContent += balNow === "active" ? " Using active balance." : " Using passive balance.";
-    }
+  if (bal === "auto" && balNow && (c.nbal || ocv >= 25)) {
+    $("cell-say").textContent += balNow === "active" ? " Using active balance." : " Using passive balance.";
   }
   const box = $("cellbars");
   const items = c.items || [];

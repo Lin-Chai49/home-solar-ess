@@ -181,6 +181,18 @@ class Pack:
     def vmin(self):
         return min(c["v"] for c in self.cells)
 
+    def ocv_span(self):
+        """Open-circuit spread, and the high and low cell indexes.
+
+        Balance uses this. Terminal voltage still includes I·R, so a few
+        kilowatts can make the high-resistance cell look highest or lowest
+        without it being the one that is ahead or behind.
+        """
+        vs = [lfp_v(c["soc"]) for c in self.cells]
+        hi = max(range(N_CELL), key=lambda i: vs[i])
+        lo = min(range(N_CELL), key=lambda i: vs[i])
+        return vs[hi] - vs[lo], hi, lo
+
     def tmax(self):
         return max(c["t"] for c in self.cells)
 
@@ -326,26 +338,30 @@ class Pack:
         self.refresh(i_pack)
 
     def _balance(self, mode, p_kw, i_pack, dt_h):
+        """Bleed or shuttle by open-circuit voltage.
+
+        i_pack is unused on purpose. Ranking the loaded voltage would bleed
+        cell 7 while charging, and that cell is the one already behind.
+        """
+        del i_pack
         if mode == "off" or dt_h <= 0:
             return
-        vs = [c["v"] for c in self.cells]
-        dv = max(vs) - min(vs)
-        if dv < DV_BAL:
+        dv, hi_i, lo_i = self.ocv_span()
+        if dv < DV_BAL or hi_i == lo_i:
             return
-        lo = min(self.cells, key=lambda c: c["v"])
         if mode == "passive":
             if p_kw > 0.05:
                 return
+            lo_v = lfp_v(self.cells[lo_i]["soc"])
             for c in self.cells:
-                if c["v"] - lo["v"] >= DV_BAL:
+                if lfp_v(c["soc"]) - lo_v >= DV_BAL:
                     cap = self.cap_ah * c["cap"]
                     c["soc"] -= 0.08 * dt_h / cap * 100.0
                     c["soc"] = max(0.0, min(100.0, c["soc"]))
                     c["bal"] = True
         elif mode == "active":
-            hi = max(self.cells, key=lambda c: c["v"])
-            if hi is lo:
-                return
+            hi = self.cells[hi_i]
+            lo = self.cells[lo_i]
             i_eq = 0.8
             d_hi = i_eq * dt_h / (self.cap_ah * hi["cap"]) * 100.0
             d_lo = i_eq * dt_h / (self.cap_ah * lo["cap"]) * 100.0 * 0.9
@@ -372,11 +388,13 @@ class Pack:
         lo = min(range(N_CELL), key=lambda i: self.cells[i]["v"])
         nbal = sum(1 for c in self.cells if c["bal"])
         flags = [i + 1 for i, c in enumerate(self.cells) if c["flag"]]
+        ocv_dv, _, _ = self.ocv_span()
         return {
             "n": N_CELL,
             "vmax": round(max(vs), 3),
             "vmin": round(min(vs), 3),
             "dv_mv": round((max(vs) - min(vs)) * 1000),
+            "ocv_dv_mv": round(ocv_dv * 1000),
             "hi": hi + 1,
             "lo": lo + 1,
             "nbal": nbal,
@@ -810,7 +828,7 @@ class House:
         ):
             self.brain.bal = self.brain._llm_bal
             return self.brain._llm_bal
-        dv = self.pack.vmax() - self.pack.vmin()
+        dv, _, _ = self.pack.ocv_span()
         self.brain.bal = "active" if dv >= 0.05 else "passive"
         return self.brain.bal
 
@@ -1225,6 +1243,71 @@ def _check_cell():
         print("cell empty", p0, why0)
         return 1, ""
     return 0, why
+
+
+def _check_ocv_balance():
+    """A loaded reading must not choose who is balanced.
+
+    At equal SOC, a few kilowatts makes cell 7 look highest while charging
+    and lowest while discharging. That spread is shown. It is not bled.
+    With a real open-circuit gap, active balance still moves charge from
+    the high cell to cell 7 during a hard charge.
+    """
+    def equal(mode, p_kw):
+        p = Pack(10.0, 50)
+        for c in p.cells:
+            c["soc"] = 50.0
+        p.apply(p_kw, 120.0, mode, 0.96)
+        return p
+
+    charged = equal("active", -5.0)
+    if any(c["bal"] for c in charged.cells):
+        print("loaded active", round((charged.vmax() - charged.vmin()) * 1000))
+        return 1
+    snap = charged.snapshot()
+    if snap["dv_mv"] < 50 or snap["ocv_dv_mv"] > 5:
+        print("loaded span", snap["dv_mv"], snap["ocv_dv_mv"])
+        return 1
+    if any(c["bal"] for c in equal("passive", -5.0).cells):
+        print("loaded passive")
+        return 1
+    if any(c["bal"] for c in equal("active", 5.0).cells):
+        print("loaded discharge")
+        return 1
+
+    def ends(mode):
+        p = Pack(10.0, 90)
+        p.apply(-3.0, 600.0, mode, 0.96)
+        return [c["soc"] for c in p.cells], [c["bal"] for c in p.cells]
+
+    off, _ = ends("off")
+    act, abal = ends("active")
+    if act[6] <= off[6] + 0.01 or not abal[6]:
+        print("active low cell", act[6], off[6], abal[6])
+        return 1
+    if max(act) >= max(off) - 0.02 or not abal[2]:
+        print("active high cell", max(act), max(off), abal[2])
+        return 1
+    pas, pbal = ends("passive")
+    if pas[6] < off[6] - 1e-4 or pbal[6]:
+        print("passive bled low cell", pas[6], off[6], pbal[6])
+        return 1
+    if not pbal[2] or pas[2] >= off[2]:
+        print("passive missed high cell", pas[2], off[2], pbal[2])
+        return 1
+
+    h = _fresh("auto")
+    for c in h.pack.cells:
+        c["soc"] = 50.0
+    h.pack.refresh(h.pack._current(-5.0, 0.96))
+    if h._balance_mode() != "passive" or h.pack.vmax() - h.pack.vmin() < 0.05:
+        print("auto loaded", h._balance_mode(), h.pack.vmax() - h.pack.vmin())
+        return 1
+    h.pack.set_soc(95)
+    if h._balance_mode() != "active":
+        print("auto top", h.pack.ocv_span()[0])
+        return 1
+    return 0
 
 
 def _check_llm():
@@ -1768,6 +1851,7 @@ def check():
     if code:
         return code
     for part in (
+        _check_ocv_balance,
         _check_llm,
         _check_valley,
         _check_hours,

@@ -56,7 +56,7 @@ Sanity check for the physics and a few dispatch cases:
 python3 server.py check
 ```
 
-That command should print a line starting with `ok` and exit 0. It checks power balance, the SOC window, cell cutoff, off-peak charging, export curtailment, hour ranges, the 12-hour plan, near-empty and near-full Auto power, a midnight rollover, a paused save, and the local HTTP paths. The same check runs on Python 3.9, 3.12, and 3.14 in GitHub Actions.
+That command should print a line starting with `ok` and exit 0. It checks power balance, the SOC window, cell cutoff, off-peak charging, export curtailment, hour ranges, the 12-hour plan, near-empty and near-full Auto power, a midnight rollover, a paused save, open-circuit balancing, and the local HTTP paths. The same check runs on Python 3.9, 3.12, and 3.14 in GitHub Actions.
 
 ---
 
@@ -137,7 +137,7 @@ Saving system size or rates does not rewind the battery. The “Charge now” bo
 
 The pack is **16 cells in series**, lithium iron phosphate, household 48 V class.
 
-- Open-circuit voltage follows a typical LFP curve: steep at the bottom, **almost flat from ~20–80%**, then a knee near full. Voltage-based balancing therefore does little in the mid band and shows up near the top.
+- Open-circuit voltage follows a typical LFP curve: steep at the bottom, **almost flat from ~20–80%**, then a knee near full. Balancing uses that open-circuit voltage, so it does little in the mid band and shows up near the top.
 - Pack current is the same through every series cell. A weaker cell’s SOC moves faster.
 - **Cell 7** is given lower capacity (~0.94×) and higher resistance on purpose, so the UI has something to show. Cell 3 starts a little higher.
 - Terminal voltage includes IR drop: during charge a high-resistance cell looks **higher** in volts even if its SOC is behind. That drop uses the DC pack current, after the one-way efficiency.
@@ -158,12 +158,14 @@ Charge is limited by the **highest** cell; discharge by the **lowest**. That is 
 
 | Mode | Behaviour |
 |---|---|
-| Auto | Passive while spread is modest; active if spread ≥ 50 mV |
-| Passive | ~80 mA bleed on high cells, mainly while charging or idle. Too small to fight kilowatts of charge current — spread often **grows** during fast charge and closes near full or rest. That is realistic for a ~200 Ah cell. |
-| Active | ~0.8 A from the highest cell to the lowest |
+| Auto | Passive while open-circuit spread is under 50 mV; active at 50 mV or more |
+| Passive | ~80 mA bleed on cells whose open-circuit voltage is at least 25 mV above the lowest, while charging or idle. Not while discharging. Too small to fight kilowatts of charge current — that is realistic for a ~200 Ah cell. |
+| Active | ~0.8 A from the highest open-circuit cell to the lowest, including while the pack is carrying current |
 | Off | No balancing |
 
-Threshold to start balancing: about **25 mV**. After balancing, SOC is clamped to 0–100%.
+Threshold to start balancing: about **25 mV of open-circuit voltage**. After balancing, SOC is clamped to 0–100%.
+
+The bars and the spread alarm use **terminal** voltage, which includes IR drop. At a few kilowatts, cell 7’s extra resistance is tens of millivolts, so it can look like the highest cell while charging and the lowest while discharging even when its SOC is the low one. Balancing that reading would widen the real gap. The cell snapshot therefore has two spreads: `dv_mv` is the loaded one on screen, and `ocv_dv_mv` is the open-circuit one the balancer uses. The loaded spread still grows during a fast charge and still closes near rest.
 
 There is **no** thermal-runaway probability, no gas sensor, and no made-up “82% risk” meter.
 
