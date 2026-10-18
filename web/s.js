@@ -137,6 +137,12 @@ function fill(s) {
   }
 }
 
+function barSpan(mins) {
+  if (mins == null || mins >= 59.5) return "";
+  const whole = Math.abs(mins - Math.round(mins)) < 0.05;
+  return " for " + n(mins, whole ? 0 : 1) + " min";
+}
+
 function drawPlan(plan, why, mode) {
   const box = $("planbars");
   const fallback = "Planned from the next 12 hours of solar, load, and rates.";
@@ -163,7 +169,7 @@ function drawPlan(plan, why, mode) {
     el.style.height = Math.max(6, Math.abs(p.p) / mx * 100) + "%";
     el.className = p.p < -0.05 ? "chg" : (p.p > 0.05 ? "dis" : "");
     const act = p.p < 0 ? "charge " + n(-p.p, 1) : p.p > 0 ? "discharge " + n(p.p, 1) : "idle";
-    el.title = p.t + " " + p.band + "  " + act + " kW  SOC " + p.soc + "%";
+    el.title = p.t + " " + p.band + "  " + act + " kW" + barSpan(p.mins) + "  SOC " + p.soc + "%";
     el.firstChild.textContent = p.t.slice(0, 2);
   });
 }

@@ -471,29 +471,42 @@ class Brain:
         cfg = house.cfg
         pcs = cfg["pcs_kw"]
         soc = house.soc
-        h0 = house.now.hour + house.now.minute / 60.0
+        # Bars are clock hours. The first one is only the rest of this hour.
+        # On an exact hour that remainder is 1, so the energy caps match a
+        # full hour.
+        now_h = (
+            house.now.hour
+            + house.now.minute / 60.0
+            + house.now.second / 3600.0
+            + house.now.microsecond / 3.6e9
+        )
+        start = int(now_h) % 24
+        frac = min(1.0, max(1e-6, 1.0 - (now_h - int(now_h))))
         f_pv, f_load, f_band = [], [], []
         for i in range(24):
-            h = h0 + i
+            h = start + i
             f_pv.append(pv_curve(h, cfg["pv_kw"], self.cloud_hat))
             f_load.append(self.load_hat[int(h) % 24])
             f_band.append(price_of(cfg, h)[1])
         f_pv[0], f_load[0] = pv, load
-        p_now, p_hour, why = self._intent(0, h0, f_pv, f_load, f_band, soc, cfg)
+        p_now, p_hour, why = self._intent(0, start, f_pv, f_load, f_band, soc, cfg, frac)
         if self.llm_on and self._llm_p is not None:
             p_now = max(-pcs, min(pcs, self._llm_p))
             p_hour = p_now
             why = self._llm_why
-        self.plan = self._roll(h0, soc, p_hour, f_pv, f_load, f_band, cfg)
+        self.plan = self._roll(start, soc, p_hour, f_pv, f_load, f_band, cfg, frac)
         return p_now, why
 
-    def _intent(self, i, h0, f_pv, f_load, f_band, soc, cfg):
-        """Return (power now, one-hour average, reason).
+    def _intent(self, i, h0, f_pv, f_load, f_band, soc, cfg, hours=1.0):
+        """Return (power now, bar average, reason).
 
         Power now follows the inverter and the house. Leftover kWh is not a
-        kW cap. The hour average is also limited to the energy that hour can
+        kW cap. The bar average is also limited to the energy that bar can
         spend, so one bar does not use the evening reserve all at once.
+        `hours` is 1 for a later clock hour, and the fraction left in the
+        current hour for the first bar. A full hour keeps the same cap.
         """
+        hours = max(float(hours), 1e-6)
         pcs = cfg["pcs_kw"]
         mn, mx = cfg["soc_min"], cfg["soc_max"]
         cap = max(cfg["batt_kwh"], 0.1)
@@ -523,14 +536,14 @@ class Brain:
             if room <= 0.05:
                 return 0.0, 0.0, "Battery is full. Not storing more."
             p_now = clip(net)
-            p_hour = clip(max(p_now, -(max(room, 0.0) / eta)))
+            p_hour = clip(max(p_now, -(max(room, 0.0) / eta / hours)))
             return p_now, p_hour, "Solar surplus. Store it in the battery first."
         if band == "Peak":
             if net > 0.05:
                 if avail <= 0.05:
                     return 0.0, 0.0, "Peak rate. Battery is at its minimum, so the house stays on the grid."
                 p_now = clip(net)
-                p_hour = clip(min(p_now, max(avail, 0.0) * eta))
+                p_hour = clip(min(p_now, max(avail, 0.0) * eta / hours))
                 return p_now, p_hour, "Peak rate. Use the battery to cover the house."
             return 0.0, 0.0, "Peak rate. Load and solar are about even."
         if band == "Off-peak":
@@ -538,7 +551,11 @@ class Brain:
             need_grid = reserve - avail - 0.85 * pv_before_peak
             if need_grid > 0.2 and room > 0.1:
                 p_now = clip(-pcs)
-                hour_cap = min(pcs, max(need_grid, 0.0) / eta, max(room, 0.0) / eta)
+                hour_cap = min(
+                    pcs,
+                    max(need_grid, 0.0) / eta / hours,
+                    max(room, 0.0) / eta / hours,
+                )
                 return p_now, clip(-hour_cap), "Off-peak, and evening peak still needs energy. Charge cheap now."
             if pv_before_peak > 1:
                 return 0.0, 0.0, "Off-peak. Daytime solar can fill the battery, so skip grid charge."
@@ -547,27 +564,30 @@ class Brain:
         spare = avail - keep
         if net > 0.05 and spare > 0.3:
             p_now = clip(net)
-            p_hour = clip(min(p_now, max(spare, 0.0) * eta))
+            p_hour = clip(min(p_now, max(spare, 0.0) * eta / hours))
             return p_now, p_hour, "Mid rate. Use the battery for the house, keep some for peak."
         return 0.0, 0.0, "Mid rate. Hold charge for peak. House on the grid."
 
-    def _roll(self, h0, soc, p0, f_pv, f_load, f_band, cfg):
+    def _roll(self, h0, soc, p0, f_pv, f_load, f_band, cfg, first_hours=1.0):
         cap = max(cfg["batt_kwh"], 0.1)
         mn, mx = cfg["soc_min"], cfg["soc_max"]
         eta = min(0.99, max(0.5, cfg["eta"]))
+        first_hours = max(float(first_hours), 1e-6)
         out = []
         s = soc
         for i in range(12):
-            _now, p, _why = self._intent(i, h0, f_pv, f_load, f_band, s, cfg)
+            hours = first_hours if i == 0 else 1.0
+            _now, p, _why = self._intent(i, h0, f_pv, f_load, f_band, s, cfg, hours)
             if i == 0:
                 p = p0
-            # One bar is one hour. The hour value already keeps the evening
-            # reserve. Clip again to the inverter, export, and the SOC window.
-            p = _clip_hour(p, f_pv[i], f_load[i], s, cfg)
+            # The bar value already keeps the evening reserve. Clip again to
+            # the inverter, export, and the energy this length of time can
+            # spend. Later bars are full clock hours.
+            p = _clip_hour(p, f_pv[i], f_load[i], s, cfg, hours)
             if p > 0:
-                s -= p / eta / cap * 100.0
+                s -= p * hours / eta / cap * 100.0
             elif p < 0:
-                s += (-p) * eta / cap * 100.0
+                s += (-p) * hours * eta / cap * 100.0
             s = max(mn, min(mx, s))
             hh = int(h0 + i) % 24
             out.append({
@@ -577,12 +597,18 @@ class Brain:
                 "load": round(f_load[i], 2),
                 "p": round(p, 2),
                 "soc": round(s, 1),
+                "mins": round(hours * 60.0, 1),
             })
         return out
 
 
-def _clip_hour(p, pv, load, soc, cfg):
-    """Limit one plan hour to the inverter, the export rule, and the SOC window."""
+def _clip_hour(p, pv, load, soc, cfg, hours=1.0):
+    """Limit one plan bar to the inverter, the export rule, and the SOC window.
+
+    `hours` is the length of the bar. Room in the window is energy, so the
+    kW cap is that energy divided by the length. One hour matches the old cap.
+    """
+    hours = max(float(hours), 1e-6)
     pcs = max(float(cfg.get("pcs_kw", 5)), 0.0)
     p = max(-pcs, min(pcs, float(p)))
     if not cfg.get("export", True) and p > 0:
@@ -593,10 +619,10 @@ def _clip_hour(p, pv, load, soc, cfg):
     mx = float(cfg.get("soc_max", 100))
     if p > 0:
         room = max(0.0, (float(soc) - mn) / 100.0 * cap)
-        p = min(p, room * eta)
+        p = min(p, room * eta / hours)
     elif p < 0:
         room = max(0.0, (mx - float(soc)) / 100.0 * cap)
-        p = max(p, -(room / eta))
+        p = max(p, -(room / eta) / hours)
     return p
 
 
@@ -1811,6 +1837,75 @@ def _check_headroom():
     return 0
 
 
+def _check_partial_hour():
+    """A bar that starts mid-hour spends only the minutes left, not a full hour."""
+    def setup(hour, minute, second=0):
+        h = _fresh("auto")
+        h.cfg["pv_kw"] = 0
+        h.cfg["pcs_kw"] = 5
+        h.cfg["eta"] = 0.96
+        h.cloud = 0
+        h.brain.cloud_hat = 0
+        h.brain.load_hat = [0.2] * 24
+        for hr in (18, 19, 20):
+            h.brain.load_hat[hr] = 2.0
+        h.now = datetime(2026, 6, 21, hour, minute, second)
+        h._reset_today(h.now)
+        h.pack.set_soc(40)
+        h.soc = h.pack.mean_soc()
+        return h
+
+    full = setup(20, 0, 0)
+    p, why = full._decide(0.0, 2.0)
+    full_bar = full.brain.plan[0] if full.brain.plan else None
+    if p < 1.5 or "cover the house" not in why or not full_bar:
+        print("partial full live", p, why, full_bar)
+        return 1
+    if full_bar["t"] != "20:00" or full_bar["mins"] != 60 or full_bar["soc"] > 25:
+        print("partial full bar", full_bar)
+        return 1
+    full_drop = full.soc - full_bar["soc"]
+    if full_drop < 15:
+        print("partial full drop", full_drop, full_bar)
+        return 1
+
+    late = setup(20, 59, 0)
+    p, why = late._decide(0.0, 2.0)
+    if p < 1.5 or "cover the house" not in why or len(late.brain.plan) < 2:
+        print("partial late live", p, why, late.brain.plan[:2])
+        return 1
+    bar, nxt = late.brain.plan[0], late.brain.plan[1]
+    if bar["t"] != "20:00" or bar["band"] != "Peak" or bar["p"] < 1.5 or bar["mins"] != 1:
+        print("partial late bar", bar)
+        return 1
+    drop = late.soc - bar["soc"]
+    if drop < full_drop / 90.0 or drop > full_drop / 30.0 or bar["soc"] < 35:
+        print("partial late soc", drop, full_drop, bar)
+        return 1
+    if nxt["t"] != "21:00" or nxt["band"] != "Mid" or nxt["mins"] != 60 or nxt["soc"] < 30:
+        print("partial next", nxt)
+        return 1
+
+    half_min = setup(20, 59, 30)
+    half_min._decide(0.0, 2.0)
+    short = half_min.brain.plan[0]
+    if short["mins"] != 0.5 or short["soc"] <= bar["soc"]:
+        print("partial seconds", short, bar)
+        return 1
+
+    half = setup(18, 30, 0)
+    p, why = half._decide(0.0, 2.0)
+    hb = half.brain.plan[0] if half.brain.plan else None
+    if p < 1.5 or not hb or hb["t"] != "18:00" or hb["mins"] != 30:
+        print("partial half", p, why, hb)
+        return 1
+    half_drop = half.soc - hb["soc"]
+    if half_drop < full_drop * 0.4 or half_drop > full_drop * 0.6:
+        print("partial half drop", half_drop, full_drop, hb)
+        return 1
+    return 0
+
+
 def _check_midnight():
     h = _fresh("stop")
     h.cloud = 0
@@ -1862,6 +1957,7 @@ def check():
         _check_soc_track,
         _check_plan,
         _check_headroom,
+        _check_partial_hour,
         _check_midnight,
         _check_manual_limit,
         _check_http,
