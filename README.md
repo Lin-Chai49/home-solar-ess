@@ -56,7 +56,7 @@ Sanity check for the physics and a few dispatch cases:
 python3 server.py check
 ```
 
-That command should print a line starting with `ok` and exit 0. It checks power balance, the SOC window, cell cutoff, off-peak charging, export curtailment, hour ranges, the 12-hour plan, a plan bar that covers only the rest of the current hour, near-empty and near-full Auto power, a midnight rollover, a paused save, open-circuit balancing, and the local HTTP paths. The same check runs on Python 3.9, 3.12, and 3.14 in GitHub Actions.
+That command should print a line starting with `ok` and exit 0. It checks power balance, the SOC window, cell cutoff, off-peak charging, export curtailment, hour ranges, the 12-hour plan, a plan bar that covers only the rest of the current hour, near-empty and near-full Auto power, a midnight rollover, a tariff hour boundary, a paused save, open-circuit balancing, and the local HTTP paths. The same check runs on Python 3.9, 3.12, and 3.14 in GitHub Actions.
 
 ---
 
@@ -129,7 +129,7 @@ Demo speed:
 
 **Restart today** sets the clock to 00:00 of the simulated day and zeros today’s energy counters. It does **not** wipe cell imbalance.
 
-Saving system size or rates does not rewind the battery. The “Charge now” box is sent only after you edit it. A control change while paused does not move the simulated clock or the pack. It does refresh the status line and, in Auto, the plan, using the solar and load already on screen. Lowering inverter kW pulls the manual setpoint back inside the new limit. A step that crosses midnight keeps only the later part in today’s energy and bill.
+Saving system size or rates does not rewind the battery. The “Charge now” box is sent only after you edit it. A control change while paused does not move the simulated clock or the pack. It does refresh the status line and, in Auto, the plan, using the solar and load already on screen. Lowering inverter kW pulls the manual setpoint back inside the new limit. A step that crosses midnight keeps only the later part in today’s energy and bill. A step that crosses a tariff hour is split the same way: energy before the hour is billed and dispatched at that hour, and energy after it uses the next hour. A step that lands exactly on the hour still belongs to the hour it started in.
 
 ---
 

@@ -868,29 +868,43 @@ class House:
             left -= chunk
 
     def _step(self, dt_s):
-        """Advance the house. A step that crosses midnight splits today's totals."""
-        if dt_s <= 0:
-            return
-        end = self.now + timedelta(seconds=dt_s)
-        midnight = datetime.combine(end.date(), datetime.min.time())
-        if self.day == self.now.date() and self.now < midnight <= end:
-            self._apply_interval((midnight - self.now).total_seconds())
-            self._reset_today(midnight)
-            self.now = midnight
-            rest = (end - midnight).total_seconds()
-            if rest > 1e-6:
-                self._apply_interval(rest)
-            return
-        if end.date() != self.day:
-            self._reset_today(end)
-        self._apply_interval(dt_s)
+        """Advance the house one slice per clock hour.
 
-    def _apply_interval(self, dt_s):
+        A slice is billed and dispatched at the hour it starts in. Landing
+        exactly on the next hour does not spill into that hour. Crossing
+        midnight still keeps only the later part in today's totals.
+        """
         if dt_s <= 0:
             return
-        t = self.now + timedelta(seconds=dt_s)
-        self.now = t
-        hour = t.hour + t.minute / 60.0 + t.second / 3600.0
+        if self.day != self.now.date():
+            self._reset_today(self.now)
+        end = self.now + timedelta(seconds=dt_s)
+        while self.now < end:
+            boundary = self.now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+            nxt = boundary if boundary < end else end
+            self._apply_interval(nxt)
+            if (
+                nxt.hour == 0
+                and nxt.minute == 0
+                and nxt.second == 0
+                and nxt.microsecond == 0
+                and self.day != nxt.date()
+            ):
+                self._reset_today(nxt)
+
+    def _apply_interval(self, end):
+        start = self.now
+        if end <= start:
+            return
+        dt_s = (end - start).total_seconds()
+        # Auto and peak/off-peak read self.now. Price this slice before the
+        # clock moves, or a step that lands on the hour is the next tariff.
+        hour = (
+            start.hour
+            + start.minute / 60.0
+            + start.second / 3600.0
+            + start.microsecond / 3.6e9
+        )
         self.cloud = min(1.0, max(0.45, self.cloud + random.uniform(-0.012, 0.012)))
         self._noise = random.random()
         pv = self.pv_avail(hour)
@@ -940,10 +954,16 @@ class House:
         self.load = load
         self.batt = p
         self.grid = grid
+        self.now = end
 
-        if not self.hist or (t - datetime.combine(t.date(), datetime.min.time())).seconds // 60 != self.hist[-1][0]:
-            minute = t.hour * 60 + t.minute
-            self.hist.append([minute, round(pv, 3), round(load, 3), round(p, 3), round(grid, 3), round(self.soc, 2)])
+        # One sample per minute. A later slice in that minute replaces it,
+        # so the point on the hour shows the new tariff.
+        minute = end.hour * 60 + end.minute
+        row = [minute, round(pv, 3), round(load, 3), round(p, 3), round(grid, 3), round(self.soc, 2)]
+        if self.hist and self.hist[-1][0] == minute:
+            self.hist[-1] = row
+        else:
+            self.hist.append(row)
             if len(self.hist) > 1500:
                 self.hist = self.hist[-1440:]
 
@@ -1938,6 +1958,92 @@ def _check_midnight():
     return 0
 
 
+def _check_hour_boundary():
+    """Bill and dispatch each slice in the hour it started."""
+    h = _fresh("stop")
+    h.cloud = 0
+    h.now = datetime(2026, 6, 21, 20, 59, 0)
+    h._reset_today(h.now)
+    h._step(60)
+    buy = h.today["buy"]
+    rate = h.today["cost"] / buy if buy else 0.0
+    if h.now != datetime(2026, 6, 21, 21, 0, 0) or buy <= 0 or abs(rate - h.cfg["price_peak"]) > 1e-6:
+        print("hour rate", h.now, rate, h.today)
+        return 1
+
+    h = _fresh("stop")
+    h.cloud = 0
+    h.now = datetime(2026, 6, 21, 20, 59, 30)
+    h._reset_today(h.now)
+    h._step(60)
+    buy = h.today["buy"]
+    rate = h.today["cost"] / buy if buy else 0.0
+    mid, peak = h.cfg["price_flat"], h.cfg["price_peak"]
+    if h.now != datetime(2026, 6, 21, 21, 0, 30) or not (mid + 0.02 < rate < peak - 0.02):
+        print("hour split", h.now, rate, h.today)
+        return 1
+
+    h = _fresh("auto")
+    h.cfg["pv_kw"] = 0
+    h.cfg["pcs_kw"] = 1
+    h.cloud = 0
+    h.brain.cloud_hat = 0
+    h.now = datetime(2026, 6, 21, 6, 59, 0)
+    h._reset_today(h.now)
+    h.pack.set_soc(30)
+    h.soc = h.pack.mean_soc()
+    h._step(60)
+    if h.now != datetime(2026, 6, 21, 7, 0, 0) or h.today["chg"] < 0.005 or "cheap" not in h.reason:
+        print("hour charge", h.now, h.today["chg"], h.reason)
+        return 1
+
+    h = _fresh("auto")
+    h.cfg["pv_kw"] = 0
+    h.cfg["pcs_kw"] = 5
+    h.cloud = 0
+    h.brain.cloud_hat = 0
+    h.now = datetime(2026, 6, 21, 17, 59, 0)
+    h._reset_today(h.now)
+    h.pack.set_soc(50)
+    h.soc = h.pack.mean_soc()
+    h._step(60)
+    if (
+        h.now != datetime(2026, 6, 21, 18, 0, 0)
+        or h.today["dis"] > 0.002
+        or h.today["buy"] < 0.005
+        or "Hold" not in h.reason
+    ):
+        print("hour hold", h.now, h.today["dis"], h.today["buy"], h.reason)
+        return 1
+
+    h = _fresh("auto")
+    h.cfg["pv_kw"] = 0
+    h.cfg["pcs_kw"] = 5
+    h.cloud = 0
+    h.brain.cloud_hat = 0
+    h.now = datetime(2026, 6, 21, 17, 59, 30)
+    h._reset_today(h.now)
+    h.pack.set_soc(50)
+    h.soc = h.pack.mean_soc()
+    h._step(30)
+    if h.today["dis"] > 0.002 or not h.hist or h.hist[-1][0] != 18 * 60 or h.hist[-1][3] > 0.2:
+        print("hour handoff", h.now, h.today["dis"], h.hist[-1] if h.hist else None)
+        return 1
+    h._step(30)
+    row = h.hist[-1] if h.hist else None
+    if (
+        h.now != datetime(2026, 6, 21, 18, 0, 30)
+        or h.today["dis"] < 0.005
+        or row is None
+        or len(h.hist) != 1
+        or row[0] != 18 * 60
+        or row[3] < 0.5
+    ):
+        print("hour chart", h.now, h.today["dis"], row, len(h.hist))
+        return 1
+    return 0
+
+
 def check():
     code, noon = _check_balance()
     if code:
@@ -1959,6 +2065,7 @@ def check():
         _check_headroom,
         _check_partial_hour,
         _check_midnight,
+        _check_hour_boundary,
         _check_manual_limit,
         _check_http,
     ):
