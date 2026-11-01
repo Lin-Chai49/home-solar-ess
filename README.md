@@ -56,7 +56,7 @@ Sanity check for the physics and a few dispatch cases:
 python3 server.py check
 ```
 
-That command should print a line starting with `ok` and exit 0. It checks power balance, the SOC window, cell cutoff, off-peak charging, export curtailment, hour ranges, the 12-hour plan, a plan bar that covers only the rest of the current hour, near-empty and near-full Auto power, a midnight rollover, a tariff hour boundary, a paused save, open-circuit balancing, and the local HTTP paths. The same check runs on Python 3.9, 3.12, and 3.14 in GitHub Actions.
+That command should print a line starting with `ok` and exit 0. It checks power balance, the SOC window, cell cutoff, off-peak charging, export curtailment, hour ranges, the 12-hour plan, a plan bar that covers only the rest of the current hour, the average solar of a full clock hour, near-empty and near-full Auto power, a midnight rollover, a tariff hour boundary, a paused save, open-circuit balancing, and the local HTTP paths. The same check runs on Python 3.9, 3.12, and 3.14 in GitHub Actions.
 
 ---
 
@@ -115,7 +115,9 @@ Auto is not a neural net. It is a small lookahead:
 - At **mid** rate, it may use the battery for the house but keeps a reserve for evening peak.
 - At the SOC limits the status says the battery is full or empty. It does not claim a charge or discharge when the power for that step is about zero.
 
-Plan bars are clock hours. The first bar covers only the rest of the current hour. Each later bar is a full hour. Bar height is power in kW, and the state of charge under the bar moves by that power times the bar’s length. A one-minute bar can stay as tall as the live power while the pack barely moves. Hover a short bar to see how many minutes it covers. Each bar is clipped to the inverter, to the energy the SOC window can still take in that length of time, and to the export rule. Near empty or full, a full-hour bar can be lower than the power right now. A mid-rate bar also keeps the energy held for evening peak. With export off, a bar does not show a discharge into the grid. Self-use, peak/off-peak, manual, and stop leave the bars empty and say the plan is drawn in Auto.
+Hours after this one use the average solar of that clock hour, not the power at :00. On this curve, 06:00–07:00 is brighter than the instant at 06:00, and 18:00–19:00 is dimmer than the instant at 18:00. An evening reserve built from the :00 reading misses part of that shortfall. This hour still uses the solar on screen.
+
+Plan bars are clock hours. The first bar covers only the rest of the current hour and uses the solar on screen. Each later bar is a full hour of that same average. Bar height is power in kW, and the state of charge under the bar moves by that power times the bar’s length. A one-minute bar can stay as tall as the live power while the pack barely moves. Hover a short bar to see how many minutes it covers. Each bar is clipped to the inverter, to the energy the SOC window can still take in that length of time, and to the export rule. Near empty or full, a full-hour bar can be lower than the power right now. A mid-rate bar also keeps the energy held for evening peak. With export off, a bar does not show a discharge into the grid. Self-use, peak/off-peak, manual, and stop leave the bars empty and say the plan is drawn in Auto.
 
 If an LLM is configured, Auto may use the model’s `p_kw` for this tick. The SOC window, inverter limit, and cell limits still apply after that. The plan bar for the current hour is clipped the same way, and only the rest of that hour moves the plan’s state of charge.
 

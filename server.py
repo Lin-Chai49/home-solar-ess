@@ -426,6 +426,28 @@ def pv_curve(hour, peak, cloud):
     return peak * math.sin(math.pi * x) * cloud
 
 
+def pv_hour_avg(hour, peak, cloud):
+    """Mean kW over one clock hour, including the minutes with no sun.
+
+    The value at :00 is not that mean. On this curve the 06:00 instant is
+    dimmer than the hour 06:00–07:00, and the 18:00 instant is brighter than
+    the hour 18:00–19:00.
+    """
+    start = int(math.floor(float(hour))) % 24
+    rise, set_ = 5.7, 19.05
+    lo = max(float(start), rise)
+    hi = min(float(start) + 1.0, set_)
+    if hi <= lo or peak <= 0 or cloud <= 0:
+        return 0.0
+    span = set_ - rise
+
+    def antideriv(h):
+        x = (h - rise) / span
+        return -math.cos(math.pi * x) * span / math.pi
+
+    return float(peak) * float(cloud) * (antideriv(hi) - antideriv(lo))
+
+
 class Brain:
     """Look 12 hours ahead from load habit, cloud, and rates, then pick charge or discharge."""
 
@@ -484,9 +506,12 @@ class Brain:
         frac = min(1.0, max(1e-6, 1.0 - (now_h - int(now_h))))
         f_pv, f_load, f_band = [], [], []
         for i in range(24):
-            h = start + i
-            f_pv.append(pv_curve(h, cfg["pv_kw"], self.cloud_hat))
-            f_load.append(self.load_hat[int(h) % 24])
+            h = (start + i) % 24
+            # Later bars spend a full clock hour, so they need that hour's
+            # energy, not the power at :00. The current bar is replaced below
+            # with the solar and load on screen.
+            f_pv.append(pv_hour_avg(h, cfg["pv_kw"], self.cloud_hat))
+            f_load.append(self.load_hat[h])
             f_band.append(price_of(cfg, h)[1])
         f_pv[0], f_load[0] = pv, load
         p_now, p_hour, why = self._intent(0, start, f_pv, f_load, f_band, soc, cfg, frac)
@@ -2044,6 +2069,81 @@ def _check_hour_boundary():
     return 0
 
 
+def _check_solar_hour():
+    """A later forecast hour is the mean kW of that clock hour, not the :00 instant.
+
+    On this sine, 06:00–07:00 is brighter than 06:00 and 18:00–19:00 is dimmer
+    than 18:00. With no leftover daytime solar, that evening gap is enough for
+    Auto to buy off-peak power at 64% SOC. The :00 reading still says the pack
+    can stand by.
+    """
+    peak, cloud = 6.0, 1.0
+    n = 240
+    for hour in range(24):
+        sample = 0.0
+        for k in range(n):
+            sample += pv_curve(hour + k / float(n), peak, cloud)
+        sample /= float(n)
+        avg = pv_hour_avg(hour, peak, cloud)
+        if abs(avg - sample) > 0.02:
+            print("solar hour mean", hour, avg, sample)
+            return 1
+    morning = pv_hour_avg(6, peak, cloud) - pv_curve(6, peak, cloud)
+    evening = pv_curve(18, peak, cloud) - pv_hour_avg(18, peak, cloud)
+    if morning < 0.4 or evening < 0.4:
+        print("solar hour shape", morning, evening)
+        return 1
+    if pv_hour_avg(12, 0, cloud) != 0.0 or pv_hour_avg(12, peak, 0) != 0.0:
+        print("solar hour dark")
+        return 1
+
+    h = _fresh("auto")
+    h.cfg["pv_kw"] = peak
+    h.now = datetime(2026, 6, 21, 23, 0, 0)
+    h.soc = 64.0
+    h.brain.cloud_hat = cloud
+    # Lift daytime load above both forecasts so surplus solar cannot hide
+    # the dimmer evening hour. Hours 18–20 keep the usual evening load.
+    for hour in range(18):
+        brighter = max(pv_curve(hour, peak, cloud), pv_hour_avg(hour, peak, cloud))
+        h.brain.load_hat[hour] = max(h.brain.load_hat[hour], brighter + 0.05)
+    start = h.now.hour
+    f_pv, f_load, f_band = [], [], []
+    for i in range(24):
+        hh = (start + i) % 24
+        f_pv.append(pv_curve(float(hh), peak, cloud))
+        f_load.append(h.brain.load_hat[hh])
+        f_band.append(price_of(h.cfg, hh)[1])
+    f_pv[0], f_load[0] = 0.0, 0.4
+    old_p, _old_bar, old_why = h.brain._intent(
+        0, start, f_pv, f_load, f_band, h.soc, h.cfg, 1.0
+    )
+    if old_p < -0.05 or "cheap" in old_why:
+        print("solar hour old", old_p, old_why)
+        return 1
+    p, why = h._decide(0.0, 0.4)
+    if p > -0.5 or "cheap" not in why:
+        print("solar hour charge", p, why)
+        return 1
+    bar = None
+    for item in h.brain.plan:
+        if item["t"] == "06:00":
+            bar = item
+            break
+    want = round(pv_hour_avg(6, peak, cloud), 2)
+    if (
+        not h.brain.plan
+        or h.brain.plan[0]["t"] != "23:00"
+        or h.brain.plan[0]["pv"] > 0.05
+        or bar is None
+        or abs(bar["pv"] - want) > 0.001
+        or bar["pv"] < round(pv_curve(6, peak, cloud) + 0.4, 2)
+    ):
+        print("solar hour plan", h.brain.plan[:1], bar, want)
+        return 1
+    return 0
+
+
 def check():
     code, noon = _check_balance()
     if code:
@@ -2066,6 +2166,7 @@ def check():
         _check_partial_hour,
         _check_midnight,
         _check_hour_boundary,
+        _check_solar_hour,
         _check_manual_limit,
         _check_http,
     ):
